@@ -405,11 +405,12 @@ if __name__ == "__main__":
 
     # Example 2D signal: [[x1, x2, ...], [y1, y2, ...]]
     signal = [
-        [1.2, 2.5, 0.5, 3.0],  # x values
-        [2.1, 2.0, 1.8, 2.0]   # y values
+        [1.0, 1.2, 3.0, 3.0],  # x values
+        [2.0, 2.3, 2.1, 2.0]   # y values
     ]
     times = [0.0, 0.8, 1.5, 2.2]  # Example
     outputs = monitor.monitor(signal, times=times)
     print("STLMonitor outputs:", outputs)
     final_verdict = monitor.get_final_verdict(signal, times=times)
     print("Final verdict:", final_verdict)
+    

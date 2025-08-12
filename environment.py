@@ -21,8 +21,7 @@ REGION_A = (17, 8, 3)
 REGION_B = (10, 16, 3)
 REGION_C = (5, 6, 3)
 
-# STL formula: "F_[0,10] A & F_[10,18] B" (visit A in [0,10], then B in [10,18])
-STL_FORMULA = "F_[0,10] A & F_[10,18] B"
+STL_FORMULA = "F[0,10] (A) & F[10,18] (B)"
 
 # Region predicate mapping for the transducer
 REGION_PREDICATES = {

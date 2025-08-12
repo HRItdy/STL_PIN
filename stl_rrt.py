@@ -197,9 +197,9 @@ class Node:
         self.path_theta = []
         self.path_v = []
         
-        # STL monitoring (from original code)
-        self.state_path = {'Once':{(0, 10): [], (10, 18): []}}
-        self.state_stl = {'Once':{(0, 10): None, (10, 18): None}}
+        # # STL monitoring (from original code)
+        # self.state_path = {'Once':{(0, 10): [], (10, 18): []}}
+        # self.state_stl = {'Once':{(0, 10): None, (10, 18): None}}
         
         # Tree structure
         self.parent = None
@@ -255,16 +255,27 @@ class BicycleRRT:
         self._set_region_params_atomic(self.stl_transducer, region_predicates)
 
     def _set_region_params_atomic(self, transducer, region_predicates):
-        """Recursively set region parameters for atomic transducers only."""
-        from transducer import AtomicTransducer
-        if isinstance(transducer, AtomicTransducer):
+        """FIXED: Recursively set region parameters for atomic transducers only."""
+        # Only process if this is an AtomicTransducer
+        if hasattr(transducer, 'predicate') and isinstance(transducer, AtomicTransducer):
             pred = transducer.predicate
             if pred in region_predicates:
                 center = region_predicates[pred][:2]
                 radius = region_predicates[pred][2]
                 transducer.set_region(center, radius)
-        for child in getattr(transducer, 'children', []):
-            self._set_region_params_atomic(child, region_predicates)
+                print(f"Set region for atomic predicate '{pred}': center={center}, radius={radius}")
+        
+        # Recursively process children (for compound formulas)
+        if hasattr(transducer, 'children'):
+            for child in transducer.children:
+                self._set_region_params_atomic(child, region_predicates)
+        elif hasattr(transducer, 'left') and hasattr(transducer, 'right'):
+            # Binary operators
+            self._set_region_params_atomic(transducer.left, region_predicates)
+            self._set_region_params_atomic(transducer.right, region_predicates)
+        elif hasattr(transducer, 'child'):
+            # Unary operators
+            self._set_region_params_atomic(transducer.child, region_predicates)
 
         # Control samples for bicycle model
         self.control_samples = self._generate_control_samples()
@@ -487,33 +498,33 @@ class BicycleRRT:
     # ===============================
     # STL Monitoring Methods (from original code)
     # ===============================
-    def check_task_point(self, node):
-        """Check task points for STL monitoring (from original code)"""
-        for index, value in enumerate(node.path_t):
-            for k, v in self.task_point['Once'].items():
-                if (value > (self.rand_area[1][2] - k[1]) and 
-                    value < (self.rand_area[1][2] - k[0])):
-                    dist = [(node.path_x[index] - item[0]) ** 2 + 
-                           (node.path_y[index] - item[1]) ** 2 < item[2] ** 2 
-                           for item in v]
-                    if any(dist):
-                        node.state_path['Once'][k].append(True)
-                    else:
-                        node.state_path['Once'][k].append(False)
+    # def check_task_point(self, node):
+    #     """Check task points for STL monitoring (from original code)"""
+    #     for index, value in enumerate(node.path_t):
+    #         for k, v in self.task_point['Once'].items():
+    #             if (value > (self.rand_area[1][2] - k[1]) and 
+    #                 value < (self.rand_area[1][2] - k[0])):
+    #                 dist = [(node.path_x[index] - item[0]) ** 2 + 
+    #                        (node.path_y[index] - item[1]) ** 2 < item[2] ** 2 
+    #                        for item in v]
+    #                 if any(dist):
+    #                     node.state_path['Once'][k].append(True)
+    #                 else:
+    #                     node.state_path['Once'][k].append(False)
     
-    def check_propose(self, node):
-        """Check if node satisfies STL propositions"""
-        for k, v in node.state_stl['Once'].items():
-            if v is False:
-                return False
-        return True
+    # def check_propose(self, node):
+    #     """Check if node satisfies STL propositions"""
+    #     for k, v in node.state_stl['Once'].items():
+    #         if v is False:
+    #             return False
+    #     return True
     
-    def check_aval(self, node):
-        """Check if node is available (STL satisfied)"""
-        for k, v in node.state_stl['Once'].items():
-            if v is False or v is None:
-                return False
-        return True
+    # def check_aval(self, node):
+    #     """Check if node is available (STL satisfied)"""
+    #     for k, v in node.state_stl['Once'].items():
+    #         if v is False or v is None:
+    #             return False
+    #     return True
     
     # ===============================
     # Visualization Methods (Enhanced for Bicycle Model)
@@ -538,12 +549,12 @@ class BicycleRRT:
             x, y, z = self.plot_cylinder(ox, oy, size)
             ax.plot_surface(x, y, z, color='b', alpha=0.5)
         
-        # Draw task points
-        for k, v in self.task_point['Once'].items():
-            for item in v:
-                x, y, z = self.plot_cylinder_cons(item[0], item[1],
-                    (self.rand_area[1][2] - k[1], self.rand_area[1][2] - k[0]), item[2])
-                ax.plot_surface(x, y, z, color='y', alpha=0.5)
+        # # Draw task points
+        # for k, v in self.task_point['Once'].items():
+        #     for item in v:
+        #         x, y, z = self.plot_cylinder_cons(item[0], item[1],
+        #             (self.rand_area[1][2] - k[1], self.rand_area[1][2] - k[0]), item[2])
+        #         ax.plot_surface(x, y, z, color='y', alpha=0.5)
         
         # Start point
         ax.scatter(self.start.x, self.start.y, 0, c='r', marker='x', s=100)
@@ -573,11 +584,11 @@ class BicycleRRT:
             x, y, z = self.plot_cylinder(ox, oy, size)
             ax3d.plot_surface(x, y, z, color='b', alpha=0.5)
         
-        for k, v in self.task_point['Once'].items():
-            for item in v:
-                x, y, z = self.plot_cylinder_cons(item[0], item[1],
-                    (self.rand_area[1][2] - k[1], self.rand_area[1][2] - k[0]), item[2])
-                ax3d.plot_surface(x, y, z, color='y', alpha=0.5)
+        # for k, v in self.task_point['Once'].items():
+        #     for item in v:
+        #         x, y, z = self.plot_cylinder_cons(item[0], item[1],
+        #             (self.rand_area[1][2] - k[1], self.rand_area[1][2] - k[0]), item[2])
+        #         ax3d.plot_surface(x, y, z, color='y', alpha=0.5)
         
         ax3d.scatter(self.start.x, self.start.y, 0, c='r', marker='x', s=100)
         ax3d.set_title('Final Bicycle RRT* Tree')
@@ -620,11 +631,11 @@ class BicycleRRT:
         for (ox, oy, size) in self.obstacle_list:
             self.plot_circle_2d(ox, oy, size)
         
-        # Draw task points
-        for k, v in self.task_point['Once'].items():
-            for item in v:
-                self.plot_circle_2d(item[0], item[1], item[2], color='y')
-                plt.text(item[0], item[1], str(k))
+        # # Draw task points
+        # for k, v in self.task_point['Once'].items():
+        #     for item in v:
+        #         self.plot_circle_2d(item[0], item[1], item[2], color='y')
+        #         plt.text(item[0], item[1], str(k))
         
         plt.axis("equal")
         plt.grid(True)
@@ -664,11 +675,11 @@ class BicycleRRT:
             x, y, z = self.plot_cylinder(ox, oy, size)
             ax3d.plot_surface(x, y, z, color='b', alpha=0.5)
         
-        for k, v in self.task_point['Once'].items():
-            for item in v:
-                x, y, z = self.plot_cylinder_cons(item[0], item[1],
-                    (self.rand_area[1][2] - k[1], self.rand_area[1][2] - k[0]), item[2])
-                ax3d.plot_surface(x, y, z, color='y', alpha=0.5)
+        # for k, v in self.task_point['Once'].items():
+        #     for item in v:
+        #         x, y, z = self.plot_cylinder_cons(item[0], item[1],
+        #             (self.rand_area[1][2] - k[1], self.rand_area[1][2] - k[0]), item[2])
+        #         ax3d.plot_surface(x, y, z, color='y', alpha=0.5)
         
         ax3d.scatter(self.start.x, self.start.y, 0, c='r', marker='x', s=100)
         ax3d.set_title('Bicycle RRT* Path (3D View)')
@@ -766,7 +777,7 @@ def main_bicycle_rrt_demo():
         bicycle_model=bicycle_model,
         expand_dis=3.0,           # meters
         path_resolution=0.3,      # meters
-        max_iter=300,            # iterations
+        max_iter=5000,            # iterations
         control_duration=1.0,     # seconds per control
         num_control_samples=7,    # reduced for performance
         stl_formula=STL_FORMULA,
@@ -889,11 +900,11 @@ def demonstrate_stl_monitoring():
         max_iter=150
     )
     
-    print("STL Task Points:")
-    for time_bound, points in rrt_stl.task_point['Once'].items():
-        time_start = rand_area[1][2] - time_bound[1]
-        time_end = rand_area[1][2] - time_bound[0]
-        print(f"   Time [{time_start}, {time_end}]: Visit {points}")
+    # print("STL Task Points:")
+    # for time_bound, points in rrt_stl.task_point['Once'].items():
+    #     time_start = rand_area[1][2] - time_bound[1]
+    #     time_end = rand_area[1][2] - time_bound[0]
+    #     print(f"   Time [{time_start}, {time_end}]: Visit {points}")
     
     # Run with STL monitoring
     start_time = time.time()
@@ -919,20 +930,3 @@ if __name__ == '__main__':
     
     # Main demonstration
     main_rrt = main_bicycle_rrt_demo()
-    
-    if input("\nRun comparison demo? (y/n): ").lower().startswith('y'):
-        simple_rrt, bicycle_rrt = run_bicycle_rrt_comparison()
-    
-    if input("\nRun STL monitoring demo? (y/n): ").lower().startswith('y'):
-        stl_rrt = demonstrate_stl_monitoring()
-    
-    print("\n" + "=" * 60)
-    print("DEMO COMPLETED")
-    print("Key Features Demonstrated:")
-    print("✓ Bicycle kinematic model with nonlinear dynamics")
-    print("✓ RK4 integration for accurate motion prediction")
-    print("✓ Vehicle shape collision detection")
-    print("✓ STL transducer monitoring (placeholder)")
-    print("✓ 3D visualization with time dimension")
-    print("✓ Real-time path planning capabilities")
-    print("=" * 60)
