@@ -124,36 +124,44 @@ class Transducer(ABC):
         for child in self.children:
             child.reset()
     
-    def step(self, signal: Dict[str, float], time: int) -> Optional[bool]:
-        """Process one time step and return output"""
+    def step(self, signal: Union[Tuple[float, float], List[float]], time: float) -> Optional[bool]:
+        """Process one time step and return output (supports continuous time). Signal is (x, y) or [x, y]."""
         self.t = time
         output = self.trans(signal, time)
         self.state_history.append(self.state)
         self.output_history.append(output)
-        
         return output
     
     @abstractmethod
-    def trans(self, signal: Dict[str, float], time: int) -> Optional[bool]:
-        """Transition function - must be implemented by subclasses"""
+    def trans(self, signal: Union[Tuple[float, float], List[float]], time: float) -> Optional[bool]:
+        """Transition function - must be implemented by subclasses. Signal is (x, y) or [x, y]."""
         pass
 
 class AtomicTransducer(Transducer):
     """Atomic predicate transducer"""
-    
     def __init__(self, predicate: str, parent: Optional[Transducer] = None):
         super().__init__(parent=parent)
-        self.var, self.op, self.threshold = re.split(r'(>=|<=|>|<|==)', predicate)
-        self.threshold = float(self.threshold)
         self.predicate = predicate
+        self.center = None  # Center for circle region predicates
+        self.radius = None  # Radius for circle region predicates
+        
+    def set_region(self, center: list, radius: float):
+        """Set the center and radius for circle region predicates"""
+        self.center = center
+        self.radius = radius
     
-    def trans(self, signal: Dict[str, float], time: int) -> Optional[bool]:
-        """Evaluate atomic predicate"""
-        val = signal.get(self.var, 0.0)
-        result = eval(f"{val} {self.op} {self.threshold}")
+    def trans(self, signal_point: Tuple[float, float], time: float) -> Optional[bool]:
+        """Evaluate atomic predicate for a single 2D point (x, y)"""
+        if self.center is None or self.radius is None:
+            raise ValueError(f"Region not set for predicate {self.predicate}")
+        
+        x, y = signal_point
+        dist = ((x - self.center[0]) ** 2 + (y - self.center[1]) ** 2) ** 0.5
+        result = dist <= self.radius
+        
         self.state = TransducerState.SUCCESS if result else TransducerState.FAILURE
         return result
-
+       
 class NotTransducer(Transducer):
     """Negation transducer"""
     
@@ -163,14 +171,11 @@ class NotTransducer(Transducer):
         self.children = [child]
         child.parent = self
     
-    def trans(self, signal: Dict[str, float], time: int) -> Optional[bool]:
+    def trans(self, signal: Union[Tuple[float, float], List[float]], time: float) -> Optional[bool]:
         """Negate child output"""
-        # Always step the child to get current output
         child_output = self.child.step(signal, time)
-        
         if child_output is None:
             return None
-        
         result = not child_output
         self.state = TransducerState.SUCCESS if result else TransducerState.FAILURE
         return result
@@ -186,13 +191,10 @@ class AndTransducer(Transducer):
         left.parent = self
         right.parent = self
     
-    def trans(self, signal: Dict[str, float], time: int) -> Optional[bool]:
+    def trans(self, signal: Union[Tuple[float, float], List[float]], time: float) -> Optional[bool]:
         """Conjunction logic with proper state management"""
-        # Always step children to get current outputs
         left_output = self.left.step(signal, time)
         right_output = self.right.step(signal, time)
-        
-        # Handle None outputs (unknown/pending)
         if left_output is False or right_output is False:
             self.state = TransducerState.FAILURE
             return False
@@ -214,13 +216,10 @@ class OrTransducer(Transducer):
         left.parent = self
         right.parent = self
     
-    def trans(self, signal: Dict[str, float], time: int) -> Optional[bool]:
+    def trans(self, signal: Union[Tuple[float, float], List[float]], time: float) -> Optional[bool]:
         """Disjunction logic with proper state management"""
-        # Always step children to get current outputs
         left_output = self.left.step(signal, time)
         right_output = self.right.step(signal, time)
-        
-        # Handle None outputs (unknown/pending)
         if left_output is True or right_output is True:
             self.state = TransducerState.SUCCESS
             return True
@@ -242,38 +241,29 @@ class EventuallyTransducer(Transducer):
         self.a, self.b = interval
         self.satisfaction_times = set()  # Track when child was satisfied
     
-    def trans(self, signal: Dict[str, float], time: int) -> Optional[bool]:
+    def trans(self, signal: Union[Tuple[float, float], List[float]], time: float) -> Optional[bool]:
         """Eventually transducer based on the 'Once' implementation"""
-        # Always step child to get current output
         child_output = self.child.step(signal, time)
-        
-        # Track satisfaction
         if child_output is True:
             self.satisfaction_times.add(time)
-        
-        # Check if we have any satisfaction in the interval [time+a, time+b]
         window_start = time + self.a
         window_end = time + self.b
-        
-        # Check for satisfaction in the current window
         satisfied_in_window = any(window_start <= t <= window_end for t in self.satisfaction_times)
-        
-        if time < self.a:  # Before window can start
+        if time < self.a:
             self.state = TransducerState.INACTIVE
             return None
         elif satisfied_in_window:
             self.state = TransducerState.SUCCESS
             return True
-        elif time > self.b:  # Past window
+        elif time > self.b:
             self.state = TransducerState.FAILURE
             return False
-        else:  # In window, still checking
+        else:
             self.state = TransducerState.ACTIVE
             return None
 
 class AlwaysTransducer(Transducer):
     """Always (G[a,b]) transducer - implemented as !F[a,b]!φ"""
-    
     def __init__(self, child: Transducer, interval: Tuple[int, int], parent: Optional[Transducer] = None):
         super().__init__(interval=interval, parent=parent)
         # G[a,b]φ = !F[a,b]!φ
@@ -282,7 +272,7 @@ class AlwaysTransducer(Transducer):
         self.negation = NotTransducer(self.eventually_transducer)
         self.children = [self.negation]
     
-    def trans(self, signal: Dict[str, float], time: int) -> Optional[bool]:
+    def trans(self, signal: Union[Tuple[float, float], List[float]], time: float) -> Optional[bool]:
         """Always implemented as double negation of Eventually"""
         return self.negation.trans(signal, time)
 
@@ -299,35 +289,25 @@ class UntilTransducer(Transducer):
         self.a, self.b = interval
         self.right_satisfaction_times = set()
     
-    def trans(self, signal: Dict[str, float], time: int) -> Optional[bool]:
+    def trans(self, signal: Union[Tuple[float, float], List[float]], time: float) -> Optional[bool]:
         """Until transducer implementation"""
-        # Always step children to get current outputs
         left_output = self.left.step(signal, time)
         right_output = self.right.step(signal, time)
-        
-        # Track when right is satisfied
         if right_output is True:
             self.right_satisfaction_times.add(time)
-        
-        # Check for satisfaction in window [time+a, time+b]
         window_start = time + self.a
         window_end = time + self.b
-        
-        # Find if right is satisfied in window and left holds until then
         for t_right in self.right_satisfaction_times:
             if window_start <= t_right <= window_end:
-                # Check if left held from time to t_right
                 left_held = True
                 for check_time in range(time, t_right):
                     if check_time < len(self.left.output_history):
                         if self.left.output_history[check_time] is False:
                             left_held = False
                             break
-                
                 if left_held:
                     self.state = TransducerState.SUCCESS
                     return True
-        
         if time < self.a:
             self.state = TransducerState.INACTIVE
             return None
@@ -381,40 +361,55 @@ class STLMonitor:
         self.ast = parse_formula(formula)
         self.transducer = build_transducer_from_tree(self.ast)
     
-    def monitor(self, signal: List[Dict[str, float]]) -> List[Optional[bool]]:
-        """Monitor signal and return outputs at each time step"""
+    def monitor(self, signal: List[List[float]], times: Optional[List[float]] = None) -> List[Optional[bool]]:
+        """Monitor signal and return outputs at each time step. Supports continuous time."""
         self.transducer.reset()
         outputs = []
+        if times is None:
+            # Default: use integer time steps
+            times = list(range(len(signal[0])))  # Use length of x coordinates
         
-        for t, signal_point in enumerate(signal):
+        # Convert signal format: from [[x1,x2,...], [y1,y2,...]] to [(x1,y1), (x2,y2), ...]
+        x_coords = signal[0]
+        y_coords = signal[1]
+        signal_points = list(zip(x_coords, y_coords))
+        
+        for t, signal_point in zip(times, signal_points):
             output = self.transducer.step(signal_point, t)
             outputs.append(output)
-        
         return outputs
     
-    def get_final_verdict(self, signal: List[Dict[str, float]]) -> Optional[bool]:
-        """Get final verdict after processing entire signal"""
-        outputs = self.monitor(signal)
-        # Return the last non-None output, or None if all are None
+    def get_final_verdict(self, signal: List[List[float]], times: Optional[List[float]] = None) -> Optional[bool]:
+        """Get final verdict after processing entire signal (supports continuous time)"""
+        outputs = self.monitor(signal, times=times)
         for output in reversed(outputs):
             if output is not None:
                 return output
         return None
     
 if __name__ == "__main__":
-    # Example usage
-    formula = "F[1,3](x > 5) & G[2,4](y < 10)"
+    # Task: F[0,2] A & G[2,3] B, where A and B are region predicates (within a circle)
+    formula = "F[0,2](A) & G[2,3](B)"
     monitor = STLMonitor(formula)
-    
+
+    # Set the region parameters for each atomic transducer
+    def set_region_params(transducer):
+        if isinstance(transducer, AtomicTransducer):
+            if transducer.predicate == 'A':
+                transducer.set_region([1.0, 2.0], 1.5)
+            elif transducer.predicate == 'B':
+                transducer.set_region([3.0, 2.0], 1.0)
+        for child in getattr(transducer, 'children', []):
+            set_region_params(child)
+    set_region_params(monitor.transducer)
+
+    # Example 2D signal: [[x1, x2, ...], [y1, y2, ...]]
     signal = [
-        {'x': 6, 'y': 8},
-        {'x': 4, 'y': 9},
-        {'x': 7, 'y': 11},
-        {'x': 5, 'y': 6},
-        {'x': 8, 'y': 12}
+        [1.2, 2.5, 0.5, 3.0],  # x values
+        [2.1, 2.0, 1.8, 2.0]   # y values
     ]
-    
-    outputs = monitor.monitor(signal)
-    print(outputs)  # Outputs at each time step
-    final_verdict = monitor.get_final_verdict(signal)
-    print(final_verdict)  # Final verdict after processing the signal
+    times = [0.0, 0.8, 1.5, 2.2]  # Example
+    outputs = monitor.monitor(signal, times=times)
+    print("STLMonitor outputs:", outputs)
+    final_verdict = monitor.get_final_verdict(signal, times=times)
+    print("Final verdict:", final_verdict)

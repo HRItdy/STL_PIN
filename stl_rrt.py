@@ -9,6 +9,7 @@ This implementation combines:
 
 author: merged implementation
 """
+
 import math
 import random
 import time
@@ -19,10 +20,11 @@ from typing import List, Tuple, Optional, Set, Dict, Any
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
 
-# Import the STL transducer components
-from typing import List, Dict, Any, Tuple, Union
-import re
-from collections import deque
+# Import environment and STL transducer logic
+from environment import OBSTACLE_LIST, RAND_AREA, REGION_PREDICATES, STL_FORMULA
+from transducer import parse_formula, build_transducer_from_tree, AtomicTransducer
+
+
 show_animation = True
 
 # ---------------------------
@@ -40,12 +42,10 @@ class STLFormulaManager:
         try:
             # Parse and build transducer
             tree = parse_formula(formula_string)
-            transducer = build_tst_from_tree(tree)
-            
+            transducer = build_transducer_from_tree(tree)
             self.formulas[name] = (formula_string, transducer)
             if task_regions:
                 self.task_regions[name] = task_regions
-            
             print(f"Added STL formula '{name}': {formula_string}")
             return True
         except Exception as e:
@@ -55,19 +55,19 @@ class STLFormulaManager:
     def evaluate_node(self, node, signal_converter) -> Dict[str, bool]:
         """Evaluate all formulas for a given node"""
         results = {}
-        
         # Convert node trajectory to signal format
         signal = signal_converter(node)
-        
         for name, (formula_str, transducer) in self.formulas.items():
             try:
                 # Evaluate at the start of the trajectory
-                result = transducer.evaluate(signal, 0)
+                if hasattr(transducer, 'get_final_verdict'):
+                    result = transducer.get_final_verdict(signal)
+                else:
+                    result = transducer.evaluate(signal, 0)
                 results[name] = result
             except Exception as e:
                 print(f"Error evaluating formula '{name}': {e}")
                 results[name] = False
-        
         return results
     
     def check_compliance(self, results: Dict[str, bool]) -> bool:
@@ -215,22 +215,15 @@ class Node:
 # ===============================
 class BicycleRRT:
     """RRT planning with bicycle dynamics and STL monitoring"""
-    
     def __init__(self, start_state: BicycleState, obstacle_list, rand_area,
                  bicycle_model: BicycleModel = None,
                  expand_dis=3.0, path_resolution=0.5, max_iter=500, 
                  allow_speed=3, cover_threshold=35, goal_sample_rate=5,
-                 control_duration=1.0, num_control_samples=11):
+                 control_duration=1.0, num_control_samples=11,
+                 stl_formula: str = None, region_predicates: dict = None):
         """
-        Initialize RRT planner with bicycle dynamics
-        
-        Args:
-            start_state: Initial bicycle state
-            obstacle_list: List of obstacles [(x, y, radius), ...]
-            rand_area: Sampling area [(min_x, min_y, min_t), (max_x, max_y, max_t)]
-            bicycle_model: Bicycle dynamics model
+        Initialize RRT planner with bicycle dynamics and STL monitoring
         """
-        # Initialize with bicycle state
         self.start = Node(start_state)
         self.rand_area = rand_area
         self.expand_dis = expand_dis
@@ -244,17 +237,35 @@ class BicycleRRT:
         self.goal_sample_rate = goal_sample_rate
         self.control_duration = control_duration
         self.num_control_samples = num_control_samples
-        
+
         # Bicycle model
         if bicycle_model is None:
             self.bicycle_model = BicycleModel()
         else:
             self.bicycle_model = bicycle_model
-        
-        # STL monitoring (from original code)
-        self.task_point = {'Once':{(0, 10): [(17, 8, 3), (10, 16, 3)], (10, 18): [(5, 6, 3)]}}
-        self.start_node = Node(BicycleState(15, 15, 0, 0, 20))
-        
+
+        # STL transducer setup
+        if stl_formula is None:
+            stl_formula = STL_FORMULA
+        if region_predicates is None:
+            region_predicates = REGION_PREDICATES
+        tree = parse_formula(stl_formula)
+        self.stl_transducer = build_transducer_from_tree(tree)
+        # Only set region params for atomic predicates, not for operators like F, G, etc.
+        self._set_region_params_atomic(self.stl_transducer, region_predicates)
+
+    def _set_region_params_atomic(self, transducer, region_predicates):
+        """Recursively set region parameters for atomic transducers only."""
+        from transducer import AtomicTransducer
+        if isinstance(transducer, AtomicTransducer):
+            pred = transducer.predicate
+            if pred in region_predicates:
+                center = region_predicates[pred][:2]
+                radius = region_predicates[pred][2]
+                transducer.set_region(center, radius)
+        for child in getattr(transducer, 'children', []):
+            self._set_region_params_atomic(child, region_predicates)
+
         # Control samples for bicycle model
         self.control_samples = self._generate_control_samples()
     
@@ -280,57 +291,57 @@ class BicycleRRT:
         return controls
     
     def planning(self, animation=True):
-        """RRT path planning with bicycle dynamics"""
+        """RRT path planning with bicycle dynamics and STL monitoring"""
         self.node_list = [self.start]
-        
+
         for i in range(self.max_iter):
             print(f"Iteration {i}/{self.max_iter}")
-            
+
             # Sample random state
             rnd_node = self.get_random_node()
             nearest_node = self.get_nearest_node_index(self.node_list, rnd_node)
-            
             if nearest_node is None:
                 continue
-            
+
             # Steer with bicycle dynamics
             new_node = self.steer_bicycle(nearest_node, rnd_node)
             if new_node is None:
                 continue
-            
-            # STL monitoring (from original code)
-            for k, v in self.task_point['Once'].items():
-                checker = Once(self.rand_area[1][2], nearest_node, new_node, k)
-                new_node.state_stl['Once'][k] = checker.trans()
-            
-            print("STL check results:")
-            for k, v in new_node.state_stl['Once'].items():
-                print(f'bound: {k}, value: {v}')
-            
+
+            # STL monitoring: check if the new edge (trajectory) satisfies STL
+            # Prepare trajectory as [[x1, x2, ...], [y1, y2, ...]] and times
+            signal = [new_node.path_x, new_node.path_y]
+            times = new_node.path_t
+            self.stl_transducer.reset()
+            stl_outputs = []
+            for t, pt in zip(times, zip(new_node.path_x, new_node.path_y)):
+                stl_outputs.append(self.stl_transducer.step(pt, t))
+            # Accept edge if STL verdict is not False at any step (i.e., not violated)
+            stl_valid = all(o is not False for o in stl_outputs)
+
+            print(f"STL check for edge: {stl_outputs} -> valid: {stl_valid}")
+
             # Check collision and STL compliance
-            if (self.check_collision_bicycle(new_node, self.obstacle_list) and 
-                self.check_propose(new_node)):
-                
+            if self.check_collision_bicycle(new_node, self.obstacle_list) and stl_valid:
                 self.node_list.append(new_node)
                 new_node.parent = nearest_node
                 nearest_node.children.append(new_node)
-                
+
                 # Calculate cost
                 d_n = self.calc_distance_bicycle(new_node, nearest_node)
                 new_node.cost = new_node.parent.cost + d_n
-                
-                # Add to selectable nodes
-                if (self.rand_area[1][2] - new_node.t <= 5 and 
-                    self.check_aval(new_node)):
+
+                # Add to selectable nodes (final time window, STL still valid)
+                if (self.rand_area[1][2] - new_node.t <= 5 and stl_valid):
                     self.select_nd.append(new_node)
-            
-            if animation and i % 10 == 0:  # Show every 10 iterations
+
+            if animation and i % 10 == 0:
                 self.draw_graph(rnd_node)
-        
+
         # Final visualization
         self.draw_rrt()
-        self.draw_path_3D(self.start_node)
-        self.draw_path_2D(self.start_node)
+        self.draw_path_3D(self.start)
+        self.draw_path_2D(self.start)
     
     def steer_bicycle(self, from_node: Node, to_node: Node) -> Optional[Node]:
         """Steer using bicycle dynamics"""
@@ -385,8 +396,8 @@ class BicycleRRT:
         new_node.path_theta = [s.theta for s in trajectory_states]
         new_node.path_v = [s.v for s in trajectory_states]
         
-        # Check task points for STL monitoring
-        self.check_task_point(new_node)
+        # Optionally: remove or comment out the old STL monitoring call
+        # self.check_task_point(new_node)
         
         return new_node
     
@@ -732,16 +743,10 @@ def main_bicycle_rrt_demo():
     print("Starting Bicycle RRT* with STL Monitoring Demo")
     print("=" * 50)
     
-    # Environment setup
-    obstacle_list = [
-        (5, 16, 2),      # Static obstacle
-        (15, 5, 1.5),    # Static obstacle  
-        (10, 10, 1),     # Small obstacle
-    ]
-    
-    # Define workspace bounds: (x_min, y_min, t_min), (x_max, y_max, t_max)
-    rand_area = [(0, 0, 0), (20, 20, 20)]
-    
+    # Use environment and STL from environment.py
+    obstacle_list = OBSTACLE_LIST
+    rand_area = RAND_AREA
+
     # Create bicycle model with realistic parameters
     bicycle_model = BicycleModel(
         wheelbase=2.7,           # meters
@@ -749,11 +754,11 @@ def main_bicycle_rrt_demo():
         max_acceleration=3.0,    # m/s²
         max_steering_angle=np.pi/4  # 45 degrees max steering
     )
-    
+
     # Initial state: position (5.5, 6.5), heading=0, velocity=2 m/s, time=0
     start_state = BicycleState(x=5.5, y=6.5, theta=0.0, v=2.0, t=0.0)
-    
-    # Create RRT planner
+
+    # Create RRT planner with STL monitoring
     rrt = BicycleRRT(
         start_state=start_state,
         obstacle_list=obstacle_list,
@@ -763,7 +768,9 @@ def main_bicycle_rrt_demo():
         path_resolution=0.3,      # meters
         max_iter=300,            # iterations
         control_duration=1.0,     # seconds per control
-        num_control_samples=7     # reduced for performance
+        num_control_samples=7,    # reduced for performance
+        stl_formula=STL_FORMULA,
+        region_predicates=REGION_PREDICATES
     )
     
     print(f"Planning with bicycle model:")
