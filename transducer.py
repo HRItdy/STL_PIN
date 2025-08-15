@@ -114,6 +114,8 @@ class Transducer(ABC):
         self.state = TransducerState.INACTIVE
         self.state_history = []  # Track state changes over time
         self.output_history = []  # Track outputs over time
+        self.satisfied = False  # Track permanent satisfaction
+        self.violated = False   # Track permanent violation
         
     def reset(self):
         """Reset transducer to initial state"""
@@ -121,12 +123,21 @@ class Transducer(ABC):
         self.state = TransducerState.INACTIVE
         self.state_history.clear()
         self.output_history.clear()
+        self.satisfied = False
+        self.violated = False
         for child in self.children:
             child.reset()
     
     def step(self, signal: Union[Tuple[float, float], List[float]], time: float) -> Optional[bool]:
         """Process one time step and return output (supports continuous time). Signal is (x, y) or [x, y]."""
         self.t = time
+        
+        # If permanently satisfied or violated, return that state
+        if self.satisfied:
+            return True
+        if self.violated:
+            return False
+            
         output = self.trans(signal, time)
         self.state_history.append(self.state)
         self.output_history.append(output)
@@ -160,7 +171,7 @@ class AtomicTransducer(Transducer):
         result = dist <= self.radius
         
         self.state = TransducerState.SUCCESS if result else TransducerState.FAILURE
-        return result
+        return True if result else False
        
 class NotTransducer(Transducer):
     """Negation transducer"""
@@ -172,16 +183,28 @@ class NotTransducer(Transducer):
         child.parent = self
     
     def trans(self, signal: Union[Tuple[float, float], List[float]], time: float) -> Optional[bool]:
-        """Negate child output"""
+        """Negate child output with proper None handling"""
         child_output = self.child.step(signal, time)
+        
+        # Handle permanent states first
+        if self.child.satisfied:
+            self.violated = True
+            return False
+        if self.child.violated:
+            self.satisfied = True
+            return True
+            
+        # Standard negation logic: !None = None, !True = False, !False = True
         if child_output is None:
+            self.state = TransducerState.INACTIVE
             return None
+        
         result = not child_output
         self.state = TransducerState.SUCCESS if result else TransducerState.FAILURE
         return result
 
 class AndTransducer(Transducer):
-    """Conjunction transducer"""
+    """Conjunction transducer with proper RRT logic"""
     
     def __init__(self, left: Transducer, right: Transducer, parent: Optional[Transducer] = None):
         super().__init__(parent=parent)
@@ -192,21 +215,38 @@ class AndTransducer(Transducer):
         right.parent = self
     
     def trans(self, signal: Union[Tuple[float, float], List[float]], time: float) -> Optional[bool]:
-        """Conjunction logic with proper state management"""
+        """Conjunction logic: None & None = None, False & X = False, True & None = None, True & True = True"""
         left_output = self.left.step(signal, time)
         right_output = self.right.step(signal, time)
+        
+        # Handle permanent violations - if either child is violated, AND is violated
+        if self.left.violated or self.right.violated:
+            self.violated = True
+            return False
+            
+        # Handle permanent satisfaction - both must be satisfied
+        if self.left.satisfied and self.right.satisfied:
+            self.satisfied = True
+            return True
+        
+        # Standard AND logic with None handling
         if left_output is False or right_output is False:
             self.state = TransducerState.FAILURE
             return False
         elif left_output is True and right_output is True:
             self.state = TransducerState.SUCCESS
             return True
+        elif left_output is None or right_output is None:
+            # None & None = None, True & None = None, None & True = None
+            self.state = TransducerState.INACTIVE
+            return None
         else:
+            # Should not reach here, but default to None for safety
             self.state = TransducerState.ACTIVE
             return None
 
 class OrTransducer(Transducer):
-    """Disjunction transducer"""
+    """Disjunction transducer with proper RRT logic"""
     
     def __init__(self, left: Transducer, right: Transducer, parent: Optional[Transducer] = None):
         super().__init__(parent=parent)
@@ -217,21 +257,38 @@ class OrTransducer(Transducer):
         right.parent = self
     
     def trans(self, signal: Union[Tuple[float, float], List[float]], time: float) -> Optional[bool]:
-        """Disjunction logic with proper state management"""
+        """Disjunction logic: None | None = None, True | X = True, False | None = None, False | False = False"""
         left_output = self.left.step(signal, time)
         right_output = self.right.step(signal, time)
+        
+        # Handle permanent satisfaction - if either child is satisfied, OR is satisfied
+        if self.left.satisfied or self.right.satisfied:
+            self.satisfied = True
+            return True
+            
+        # Handle permanent violation - both must be violated
+        if self.left.violated and self.right.violated:
+            self.violated = True
+            return False
+        
+        # Standard OR logic with None handling
         if left_output is True or right_output is True:
             self.state = TransducerState.SUCCESS
             return True
         elif left_output is False and right_output is False:
             self.state = TransducerState.FAILURE
             return False
+        elif left_output is None or right_output is None:
+            # None | None = None, False | None = None, None | False = None
+            self.state = TransducerState.INACTIVE
+            return None
         else:
+            # Should not reach here, but default to None for safety
             self.state = TransducerState.ACTIVE
             return None
 
 class EventuallyTransducer(Transducer):
-    """Eventually (F[a,b]) transducer - 'Once' operator"""
+    """Eventually (F[a,b]) transducer with proper activation logic"""
     
     def __init__(self, child: Transducer, interval: Tuple[int, int], parent: Optional[Transducer] = None):
         super().__init__(interval=interval, parent=parent)
@@ -241,43 +298,87 @@ class EventuallyTransducer(Transducer):
         self.a, self.b = interval
         self.satisfaction_times = set()  # Track when child was satisfied
     
+    def reset(self):
+        """Reset transducer to initial state"""
+        super().reset()
+        self.satisfaction_times.clear()
+    
     def trans(self, signal: Union[Tuple[float, float], List[float]], time: float) -> Optional[bool]:
-        """Eventually transducer based on the 'Once' implementation"""
+        """Eventually transducer: None before [a,b], active evaluation during, resolved after"""
         child_output = self.child.step(signal, time)
         if child_output is True:
             self.satisfaction_times.add(time)
-        window_start = time + self.a
-        window_end = time + self.b
-        satisfied_in_window = any(window_start <= t <= window_end for t in self.satisfaction_times)
+        
+        # Before interval starts: inactive (None)
         if time < self.a:
             self.state = TransducerState.INACTIVE
             return None
-        elif satisfied_in_window:
+        
+        # Check if child was satisfied within the active interval [a,b]
+        satisfied_in_interval = any(self.a <= t <= self.b for t in self.satisfaction_times)
+        
+        if satisfied_in_interval:
+            # Once satisfied within interval, permanently satisfied
+            self.satisfied = True
             self.state = TransducerState.SUCCESS
             return True
         elif time > self.b:
+            # After interval ends without satisfaction: permanently violated
+            self.violated = True
             self.state = TransducerState.FAILURE
             return False
         else:
+            # Within interval [a,b], still evaluating
             self.state = TransducerState.ACTIVE
             return None
 
 class AlwaysTransducer(Transducer):
-    """Always (G[a,b]) transducer - implemented as !F[a,b]!φ"""
+    """Always (G[a,b]) transducer with proper activation logic"""
+    
     def __init__(self, child: Transducer, interval: Tuple[int, int], parent: Optional[Transducer] = None):
         super().__init__(interval=interval, parent=parent)
-        # G[a,b]φ = !F[a,b]!φ
-        negated_child = NotTransducer(child)
-        self.eventually_transducer = EventuallyTransducer(negated_child, interval)
-        self.negation = NotTransducer(self.eventually_transducer)
-        self.children = [self.negation]
+        self.child = child
+        self.children = [child]
+        child.parent = self
+        self.a, self.b = interval
+        self.violation_times = set()  # Track when child was violated
+    
+    def reset(self):
+        """Reset transducer to initial state"""
+        super().reset()
+        self.violation_times.clear()
     
     def trans(self, signal: Union[Tuple[float, float], List[float]], time: float) -> Optional[bool]:
-        """Always implemented as double negation of Eventually"""
-        return self.negation.trans(signal, time)
+        """Always transducer: None before [a,b], active evaluation during, resolved after"""
+        child_output = self.child.step(signal, time)
+        if child_output is False:
+            self.violation_times.add(time)
+        
+        # Before interval starts: inactive (None)
+        if time < self.a:
+            self.state = TransducerState.INACTIVE
+            return None
+        
+        # Check if child was violated within the active interval [a,b]
+        violated_in_interval = any(self.a <= t <= self.b for t in self.violation_times)
+        
+        if violated_in_interval:
+            # Once violated within interval, permanently violated
+            self.violated = True
+            self.state = TransducerState.FAILURE
+            return False
+        elif time > self.b:
+            # After interval ends without violation: permanently satisfied
+            self.satisfied = True
+            self.state = TransducerState.SUCCESS
+            return True
+        else:
+            # Within interval [a,b], still evaluating
+            self.state = TransducerState.ACTIVE
+            return None
 
 class UntilTransducer(Transducer):
-    """Until (U[a,b]) transducer"""
+    """Until (U[a,b]) transducer with proper activation logic"""
     
     def __init__(self, left: Transducer, right: Transducer, interval: Tuple[int, int], parent: Optional[Transducer] = None):
         super().__init__(interval=interval, parent=parent)
@@ -288,33 +389,56 @@ class UntilTransducer(Transducer):
         right.parent = self
         self.a, self.b = interval
         self.right_satisfaction_times = set()
+        self.left_violation_times = set()
+    
+    def reset(self):
+        """Reset transducer to initial state"""
+        super().reset()
+        self.right_satisfaction_times.clear()
+        self.left_violation_times.clear()
     
     def trans(self, signal: Union[Tuple[float, float], List[float]], time: float) -> Optional[bool]:
-        """Until transducer implementation"""
+        """Until transducer: φ U[a,b] ψ - φ must hold until ψ becomes true within [a,b]"""
         left_output = self.left.step(signal, time)
         right_output = self.right.step(signal, time)
+        
         if right_output is True:
             self.right_satisfaction_times.add(time)
-        window_start = time + self.a
-        window_end = time + self.b
-        for t_right in self.right_satisfaction_times:
-            if window_start <= t_right <= window_end:
-                left_held = True
-                for check_time in range(time, t_right):
-                    if check_time < len(self.left.output_history):
-                        if self.left.output_history[check_time] is False:
-                            left_held = False
-                            break
-                if left_held:
-                    self.state = TransducerState.SUCCESS
-                    return True
+        if left_output is False:
+            self.left_violation_times.add(time)
+        
+        # Before interval starts: inactive (None)
         if time < self.a:
             self.state = TransducerState.INACTIVE
             return None
+        
+        # Check if right (ψ) was satisfied within [a,b]
+        right_satisfied_in_interval = any(self.a <= t <= self.b for t in self.right_satisfaction_times)
+        
+        if right_satisfied_in_interval:
+            # Find earliest satisfaction time of right within interval
+            earliest_right_time = min(t for t in self.right_satisfaction_times if self.a <= t <= self.b)
+            
+            # Check if left was violated before right became true
+            left_violated_before_right = any(self.a <= t < earliest_right_time for t in self.left_violation_times)
+            
+            if not left_violated_before_right:
+                # Left held until right became true: permanently satisfied
+                self.satisfied = True
+                self.state = TransducerState.SUCCESS
+                return True
+            else:
+                # Left was violated before right: permanently violated
+                self.violated = True
+                self.state = TransducerState.FAILURE
+                return False
         elif time > self.b:
+            # After interval ends without right satisfaction: permanently violated
+            self.violated = True
             self.state = TransducerState.FAILURE
             return False
         else:
+            # Within interval [a,b], still evaluating
             self.state = TransducerState.ACTIVE
             return None
 
@@ -387,30 +511,75 @@ class STLMonitor:
                 return output
         return None
     
+    def should_add_to_rrt(self, output: Optional[bool]) -> bool:
+        """Determine if an edge should be added to RRT based on transducer output"""
+        # ADD edge if output is True or None, REJECT if output is False
+        return output is not False
+
+def set_region_params(transducer):
+    """Helper function to set region parameters for atomic transducers"""
+    if isinstance(transducer, AtomicTransducer):
+        if transducer.predicate == 'A':
+            transducer.set_region([1.0, 2.0], 1.5)
+        elif transducer.predicate == 'B':
+            transducer.set_region([3.0, 2.0], 1.0)
+    for child in getattr(transducer, 'children', []):
+        set_region_params(child)
+
 if __name__ == "__main__":
-    # Task: F[0,2] A & G[2,3] B, where A and B are region predicates (within a circle)
-    formula = "F[0,2](A) & G[2,3](B)"
-    monitor = STLMonitor(formula)
-
-    # Set the region parameters for each atomic transducer
-    def set_region_params(transducer):
-        if isinstance(transducer, AtomicTransducer):
-            if transducer.predicate == 'A':
-                transducer.set_region([1.0, 2.0], 1.5)
-            elif transducer.predicate == 'B':
-                transducer.set_region([3.0, 2.0], 1.0)
-        for child in getattr(transducer, 'children', []):
-            set_region_params(child)
-    set_region_params(monitor.transducer)
-
-    # Example 2D signal: [[x1, x2, ...], [y1, y2, ...]]
-    signal = [
-        [1.0, 1.2, 3.0, 3.0],  # x values
-        [2.0, 2.3, 2.1, 2.0]   # y values
-    ]
-    times = [0.0, 0.8, 1.5, 2.2]  # Example
-    outputs = monitor.monitor(signal, times=times)
-    print("STLMonitor outputs:", outputs)
-    final_verdict = monitor.get_final_verdict(signal, times=times)
-    print("Final verdict:", final_verdict)
+    print("=== STL Transducer with RRT Integration Logic ===")
     
+    # Test case demonstrating the logical system
+    formula = "F[1,2](A) & G[2,3](B)"
+    monitor = STLMonitor(formula)
+    set_region_params(monitor.transducer)
+    
+    # Test different scenarios
+    test_cases = [
+        # Time [0,1): Both constraints inactive
+        ([0.5, 0.5], 0.5, "Before any constraints activate"),
+        ([0.5, 0.5], 0.8, "Still before constraints activate"),
+        
+        # Time [1,2]: F-constraint active, G-constraint inactive  
+        ([1.2, 2.3], 1.2, "F-active: visits A, G-inactive"),
+        ([5.0, 0.0], 1.5, "F-active: doesn't visit A, G-inactive"),
+        ([1.2, 2.3], 1.8, "F-active: visits A again, G-inactive"),
+        
+        # Time [2,3]: Both constraints active
+        ([3.0, 2.0], 2.2, "Both active: A satisfied, in B"),
+        ([5.0, 0.0], 2.5, "Both active: A satisfied, not in B"),
+        ([0.0, 0.0], 2.8, "Both active: A satisfied, not in B"),
+        
+        # Time [3,∞): Both constraints resolved
+        ([0.0, 0.0], 3.5, "Both resolved: final state"),
+        ([5.0, 5.0], 4.0, "Both resolved: final state"),
+    ]
+    
+    for signal_point, time, description in test_cases:
+        monitor.transducer.reset()
+        
+        # Simulate trajectory up to this point (simplified)
+        output = monitor.transducer.step(signal_point, time)
+        should_add = monitor.should_add_to_rrt(output)
+        
+        print(f"Time {time}: {description}")
+        print(f"  Signal: {signal_point}, Output: {output}, Add to RRT: {should_add}")
+        print(f"  F-satisfied: {monitor.transducer.left.satisfied}, G-violated: {monitor.transducer.right.violated}")
+        print()
+    
+    print("=== Complete Trajectory Test ===")
+    # Complete trajectory showing state evolution
+    signal = [
+        [0.5, 1.2, 3.0, 3.0, 0.0, 0.0],  # A visited at t=1.2, B visited at t=2.2,2.8
+        [0.5, 2.3, 2.1, 2.0, 0.0, 0.0]   
+    ]
+    times = [0.5, 1.2, 2.2, 2.8, 3.5, 4.0]
+    
+    outputs = monitor.monitor(signal, times=times)
+    
+    print("Complete trajectory analysis:")
+    for i, (t, point, output) in enumerate(zip(times, zip(signal[0], signal[1]), outputs)):
+        should_add = monitor.should_add_to_rrt(output)
+        print(f"Time {t}: Point {point} -> Output: {output}, Add to RRT: {should_add}")
+    
+    print(f"\nFinal verdict: {monitor.get_final_verdict(signal, times=times)}")

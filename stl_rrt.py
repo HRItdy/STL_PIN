@@ -1,13 +1,11 @@
 """
-Merged RRT* Path Planning with Bicycle Dynamics and STL Transducer Monitoring
+Modified Bicycle RRT* Path Planning with 2D Visualization and 3D Planning
+- 2D visualization for better clarity
+- 3D planning with time dimension for STL transducer monitoring
+- Bicycle kinematic model with nonlinear dynamics
+- Real-time path planning capabilities
 
-This implementation combines:
-1. Bicycle kinematic model with nonlinear dynamics
-2. STL transducer monitoring from the original code
-3. 3D visualization with time dimension
-4. Real-time path planning capabilities
-
-author: merged implementation
+author: modified implementation
 """
 
 import math
@@ -15,7 +13,6 @@ import random
 import time
 import numpy as np
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 from typing import List, Tuple, Optional, Set, Dict, Any
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
@@ -73,8 +70,6 @@ class STLFormulaManager:
     def check_compliance(self, results: Dict[str, bool]) -> bool:
         """Check if all formulas are satisfied"""
         return all(results.values())
-
-show_animation = True
 
 # ===============================
 # Bicycle Model Components
@@ -197,10 +192,6 @@ class Node:
         self.path_theta = []
         self.path_v = []
         
-        # # STL monitoring (from original code)
-        # self.state_path = {'Once':{(0, 10): [], (10, 18): []}}
-        # self.state_stl = {'Once':{(0, 10): None, (10, 18): None}}
-        
         # Tree structure
         self.parent = None
         self.children = []
@@ -254,6 +245,14 @@ class BicycleRRT:
         # Only set region params for atomic predicates, not for operators like F, G, etc.
         self._set_region_params_atomic(self.stl_transducer, region_predicates)
 
+        # Control samples for bicycle model
+        self.control_samples = self._generate_control_samples()
+        
+        # Single figure for animation
+        self.fig = None
+        self.ax = None
+        self.cbar = None
+
     def _set_region_params_atomic(self, transducer, region_predicates):
         """FIXED: Recursively set region parameters for atomic transducers only."""
         # Only process if this is an AtomicTransducer
@@ -276,9 +275,6 @@ class BicycleRRT:
         elif hasattr(transducer, 'child'):
             # Unary operators
             self._set_region_params_atomic(transducer.child, region_predicates)
-
-        # Control samples for bicycle model
-        self.control_samples = self._generate_control_samples()
     
     def _generate_control_samples(self) -> List[BicycleControl]:
         """Generate control samples for bicycle model"""
@@ -301,36 +297,64 @@ class BicycleRRT:
         
         return controls
     
+    def setup_animation_window(self):
+        """Setup single animation window (persisted for all animation updates)"""
+        if self.fig is None or self.ax is None:
+            self.fig, self.ax = plt.subplots(figsize=(12, 8))
+            try:
+                self.fig.canvas.manager.set_window_title('Bicycle RRT* Planning Progress')
+            except Exception:
+                pass
+            # Setup colorbar only once
+            sm = plt.cm.ScalarMappable(cmap=plt.cm.viridis, 
+                                      norm=plt.Normalize(vmin=0, vmax=self.rand_area[1][2]))
+            sm.set_array([])
+            self.cbar = self.fig.colorbar(sm, ax=self.ax)
+            self.cbar.set_label('Time (s)')
+    
     def planning(self, animation=True):
-        """RRT path planning with bicycle dynamics and STL monitoring"""
+        """RRT path planning with bicycle dynamics and STL monitoring (single persistent window)"""
         self.node_list = [self.start]
+        if animation:
+            self.setup_animation_window()
 
         for i in range(self.max_iter):
             print(f"Iteration {i}/{self.max_iter}")
 
-            # Sample random state
+            # Sample random state (3D sampling: x, y, t)
             rnd_node = self.get_random_node()
             nearest_node = self.get_nearest_node_index(self.node_list, rnd_node)
             if nearest_node is None:
                 continue
 
-            # Steer with bicycle dynamics
+            # Steer with bicycle dynamics (3D extension)
             new_node = self.steer_bicycle(nearest_node, rnd_node)
             if new_node is None:
                 continue
 
             # STL monitoring: check if the new edge (trajectory) satisfies STL
-            # Prepare trajectory as [[x1, x2, ...], [y1, y2, ...]] and times
             signal = [new_node.path_x, new_node.path_y]
             times = new_node.path_t
             self.stl_transducer.reset()
             stl_outputs = []
+            stl_satisfied = False
+            # times =           [0.0, 0.5, 1, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0]
+            # new_node.path_x = [5.5,   6, 7,  10,  11,  12,  13,  14,  15,  16,   8,   8,   8,   8,   8,   8,  13]
+            # new_node.path_y = [6.5, 6.4, 6,   6,   6,   6,   6,   6,   8,  10,  11,  12,  13,  14,  13,  13,  16]
             for t, pt in zip(times, zip(new_node.path_x, new_node.path_y)):
-                stl_outputs.append(self.stl_transducer.step(pt, t))
-            # Accept edge if STL verdict is not False at any step (i.e., not violated)
+                # Check if point is in any region (for debugging)
+                if (pt[0]-17)**2 + (pt[1]-8)**2 < 3**2:  # Example condition
+                    print(f"Point {pt} at time {t} is in region A")
+                if (pt[0]-13)**2 + (pt[1]-16)**2 < 3**2:  # Example condition
+                    print(f"Point {pt} at time {t} is in region B")
+                out = self.stl_transducer.step(pt, t)
+                stl_outputs.append(out)
+                # If the transducer has a 'satisfied' attribute and it is True, mark as satisfied
+                if hasattr(self.stl_transducer, 'satisfied') and self.stl_transducer.satisfied:
+                    stl_satisfied = True
             stl_valid = all(o is not False for o in stl_outputs)
 
-            print(f"STL check for edge: {stl_outputs} -> valid: {stl_valid}")
+            print(f"STL check for edge: {stl_outputs} -> valid: {stl_valid}, satisfied: {stl_satisfied}")
 
             # Check collision and STL compliance
             if self.check_collision_bicycle(new_node, self.obstacle_list) and stl_valid:
@@ -342,20 +366,152 @@ class BicycleRRT:
                 d_n = self.calc_distance_bicycle(new_node, nearest_node)
                 new_node.cost = new_node.parent.cost + d_n
 
-                # Add to selectable nodes (final time window, STL still valid)
-                if (self.rand_area[1][2] - new_node.t <= 5 and stl_valid):
+                # Add to selectable nodes (leaf nodes that really finish the STL task)
+                # Only add if STL task is truly satisfied at this node (not just valid so far)
+                if stl_satisfied:
                     self.select_nd.append(new_node)
 
+            # Show animation every 10 iterations (persist single window)
             if animation and i % 10 == 0:
-                self.draw_graph(rnd_node)
+                self.update_animation(rnd_node, i)
 
-        # Final visualization
-        self.draw_rrt()
-        self.draw_path_3D(self.start)
-        self.draw_path_2D(self.start)
+        # Final visualization (reuse the same window)
+        if animation:
+            self.show_final_result()
+    
+    def update_animation(self, rnd_node, iteration):
+        """Update the single animation window"""
+        self.ax.clear()
+        
+        # Draw random node
+        if rnd_node is not None:
+            self.ax.scatter(rnd_node.x, rnd_node.y, c='red', marker='o', s=50, 
+                           label=f'Random (t={rnd_node.t:.1f}s)', zorder=5)
+        
+        # Draw nodes and edges with time-based coloring
+        for node in self.node_list:
+            time_color = node.t / self.rand_area[1][2]  # Normalize to [0,1]
+            self.ax.scatter(node.x, node.y, c=plt.cm.viridis(time_color), 
+                           marker='^', s=20, alpha=0.7, zorder=3)
+            
+            if node.parent:
+                self.ax.plot([node.x, node.parent.x], [node.y, node.parent.y], 
+                            'b-', alpha=0.3, linewidth=1, zorder=1)
+        
+        # Draw obstacles
+        for (ox, oy, size) in self.obstacle_list:
+            circle = plt.Circle((ox, oy), size, color='blue', alpha=0.7, zorder=2)
+            self.ax.add_patch(circle)
+        
+        # Draw task regions if available
+        if hasattr(self, 'region_predicates') and self.region_predicates:
+            for pred_name, (cx, cy, radius) in self.region_predicates.items():
+                circle = plt.Circle((cx, cy), radius, color='yellow', 
+                                  alpha=0.3, linestyle='--', zorder=2)
+                self.ax.add_patch(circle)
+                self.ax.text(cx, cy, pred_name, ha='center', va='center', zorder=4)
+        
+        # Draw selectable nodes (STL compliant)
+        for node in self.select_nd:
+            self.ax.scatter(node.x, node.y, c='green', marker='*', s=100, 
+                           alpha=0.8, zorder=4)
+        
+        # Start point
+        self.ax.scatter(self.start.x, self.start.y, c='red', marker='x', s=100, 
+                       label='Start', zorder=5)
+        
+        self.ax.set_aspect('equal')
+        self.ax.grid(True, alpha=0.3)
+        self.ax.set_xlabel('X (m)')
+        self.ax.set_ylabel('Y (m)')
+        self.ax.set_title(f'Bicycle RRT* Progress - Iteration {iteration} - {len(self.node_list)} nodes, {len(self.select_nd)} valid')
+        self.ax.legend()
+        
+        # Set consistent axis limits
+        margin = 2
+        self.ax.set_xlim(self.rand_area[0][0] - margin, self.rand_area[1][0] + margin)
+        self.ax.set_ylim(self.rand_area[0][1] - margin, self.rand_area[1][1] + margin)
+        
+        plt.pause(0.01)
+    
+    def show_final_result(self):
+        """Show final result with path"""
+        self.ax.clear()
+        
+        # Draw all nodes (faded)
+        for node in self.node_list:
+            time_color = node.t / self.rand_area[1][2]
+            self.ax.scatter(node.x, node.y, c=plt.cm.viridis(time_color), 
+                           marker='^', s=10, alpha=0.3, zorder=1)
+        
+        # Draw final path
+        if len(self.select_nd) > 0:
+            # Find best path
+            reach_list = [x for x in self.select_nd 
+                         if self.calc_distance_bicycle(x, self.start) < 20]
+            
+            if reach_list:
+                distances = [np.linalg.norm(node.state.position() - self.start.state.position()) + 
+                            node.cost for node in reach_list]
+                minind = distances.index(min(distances))
+                best_node = reach_list[minind]
+                
+                # Draw path
+                path_nodes = []
+                cn = best_node
+                while cn.parent is not None:
+                    path_nodes.append(cn)
+                    cn = cn.parent
+                path_nodes.append(cn)
+                
+                # Draw path trajectory
+                for i, node in enumerate(path_nodes):
+                    if node.parent:
+                        self.ax.plot([node.x, node.parent.x], [node.y, node.parent.y], 
+                                    'r-', linewidth=3, alpha=0.8, zorder=4)
+                    
+                    # Draw vehicle at key points
+                    if i % max(1, len(path_nodes)//5) == 0:
+                        self.draw_vehicle_on_ax(self.ax, node.state, alpha=0.7)
+                        self.ax.text(node.x + 1, node.y + 1, 
+                                    f"t={self.rand_area[1][2] - node.t:.1f}s",
+                                    fontsize=8, bbox=dict(boxstyle="round,pad=0.3", 
+                                                        facecolor="white", alpha=0.7), zorder=5)
+        
+        # Draw environment
+        for (ox, oy, size) in self.obstacle_list:
+            circle = plt.Circle((ox, oy), size, color='blue', alpha=0.7, zorder=2)
+            self.ax.add_patch(circle)
+        
+        # Draw task regions
+        if hasattr(self, 'region_predicates') and self.region_predicates:
+            for pred_name, (cx, cy, radius) in self.region_predicates.items():
+                circle = plt.Circle((cx, cy), radius, color='yellow', 
+                                  alpha=0.3, linestyle='--', linewidth=2, zorder=2)
+                self.ax.add_patch(circle)
+                self.ax.text(cx, cy, pred_name, ha='center', va='center', 
+                            fontweight='bold', zorder=4)
+        
+        # Start point
+        self.ax.scatter(self.start.x, self.start.y, c='red', marker='x', s=150, 
+                       label='Start', zorder=5)
+        
+        self.ax.set_aspect('equal')
+        self.ax.grid(True, alpha=0.3)
+        self.ax.set_xlabel('X (m)')
+        self.ax.set_ylabel('Y (m)')
+        self.ax.set_title(f'Final Result - {len(self.select_nd)} STL-compliant paths found')
+        self.ax.legend()
+        
+        # Set consistent axis limits
+        margin = 2
+        self.ax.set_xlim(self.rand_area[0][0] - margin, self.rand_area[1][0] + margin)
+        self.ax.set_ylim(self.rand_area[0][1] - margin, self.rand_area[1][1] + margin)
+        
+        plt.pause(0.1)
     
     def steer_bicycle(self, from_node: Node, to_node: Node) -> Optional[Node]:
-        """Steer using bicycle dynamics"""
+        """Steer using bicycle dynamics (3D extension with time)"""
         best_control = None
         best_new_node = None
         min_distance = float('inf')
@@ -366,7 +522,7 @@ class BicycleRRT:
             new_state = self.bicycle_model.integrate(
                 from_node.state, control, self.control_duration)
             
-            # Check if we're getting closer to target
+            # Check if we're getting closer to target (3D distance with time)
             distance = self.calc_distance_states(new_state, to_node.state)
             
             if distance < min_distance:
@@ -407,13 +563,10 @@ class BicycleRRT:
         new_node.path_theta = [s.theta for s in trajectory_states]
         new_node.path_v = [s.v for s in trajectory_states]
         
-        # Optionally: remove or comment out the old STL monitoring call
-        # self.check_task_point(new_node)
-        
         return new_node
     
     def calc_distance_states(self, state1: BicycleState, state2: BicycleState) -> float:
-        """Calculate distance between two bicycle states"""
+        """Calculate distance between two bicycle states (3D with time)"""
         pos_dist = np.linalg.norm(state1.position() - state2.position())
         angle_dist = abs(self.bicycle_model.normalize_angle(state1.theta - state2.theta))
         vel_dist = abs(state1.v - state2.v)
@@ -450,9 +603,9 @@ class BicycleRRT:
         return True  # Safe
     
     def get_random_node(self) -> Node:
-        """Generate random node with bicycle state"""
+        """Generate random node with bicycle state (3D sampling)"""
         if random.randint(0, 100) > self.goal_sample_rate:
-            # Random sampling
+            # Random sampling in 3D space (x, y, t)
             x = random.uniform(self.rand_area[0][0], self.rand_area[1][0])
             y = random.uniform(self.rand_area[0][1], self.rand_area[1][1])
             theta = random.uniform(-np.pi, np.pi)
@@ -471,7 +624,7 @@ class BicycleRRT:
         return Node(state)
     
     def get_nearest_node_index(self, node_list, rnd_node):
-        """Find nearest node considering bicycle dynamics and time constraints"""
+        """Find nearest node considering bicycle dynamics and time constraints (3D)"""
         # Nodes that are in the past (can reach the random node)
         past_list = [x for x in node_list if x.t < rnd_node.t]
         if not past_list:
@@ -490,269 +643,44 @@ class BicycleRRT:
         if not reach_list:
             return None
         
-        # Find closest node
+        # Find closest node in 3D space
         distances = [self.calc_distance_bicycle(node, rnd_node) for node in reach_list]
         min_ind = distances.index(min(distances))
         return reach_list[min_ind]
     
     # ===============================
-    # STL Monitoring Methods (from original code)
+    # 2D Visualization Methods
     # ===============================
-    # def check_task_point(self, node):
-    #     """Check task points for STL monitoring (from original code)"""
-    #     for index, value in enumerate(node.path_t):
-    #         for k, v in self.task_point['Once'].items():
-    #             if (value > (self.rand_area[1][2] - k[1]) and 
-    #                 value < (self.rand_area[1][2] - k[0])):
-    #                 dist = [(node.path_x[index] - item[0]) ** 2 + 
-    #                        (node.path_y[index] - item[1]) ** 2 < item[2] ** 2 
-    #                        for item in v]
-    #                 if any(dist):
-    #                     node.state_path['Once'][k].append(True)
-    #                 else:
-    #                     node.state_path['Once'][k].append(False)
-    
-    # def check_propose(self, node):
-    #     """Check if node satisfies STL propositions"""
-    #     for k, v in node.state_stl['Once'].items():
-    #         if v is False:
-    #             return False
-    #     return True
-    
-    # def check_aval(self, node):
-    #     """Check if node is available (STL satisfied)"""
-    #     for k, v in node.state_stl['Once'].items():
-    #         if v is False or v is None:
-    #             return False
-    #     return True
-    
-    # ===============================
-    # Visualization Methods (Enhanced for Bicycle Model)
-    # ===============================
-    def draw_graph(self, rnd=None):
-        """Draw the RRT graph with bicycle model visualization"""
-        plt.figure(3, figsize=(12, 10))
-        plt.clf()
-        ax = plt.subplot(111, projection='3d')
-        
-        if rnd is not None:
-            ax.scatter(rnd.x, rnd.y, rnd.t, c='r', marker='o', s=50)
-        
-        # Draw nodes and edges
-        for node in self.node_list:
-            ax.scatter(node.x, node.y, node.t, c='g', marker='^', s=20)
-            if node.parent:
-                self.plot_line_3d(ax, node)
-        
-        # Draw obstacles as cylinders
-        for (ox, oy, size) in self.obstacle_list:
-            x, y, z = self.plot_cylinder(ox, oy, size)
-            ax.plot_surface(x, y, z, color='b', alpha=0.5)
-        
-        # # Draw task points
-        # for k, v in self.task_point['Once'].items():
-        #     for item in v:
-        #         x, y, z = self.plot_cylinder_cons(item[0], item[1],
-        #             (self.rand_area[1][2] - k[1], self.rand_area[1][2] - k[0]), item[2])
-        #         ax.plot_surface(x, y, z, color='y', alpha=0.5)
-        
-        # Start point
-        ax.scatter(self.start.x, self.start.y, 0, c='r', marker='x', s=100)
-        
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Time')
-        ax.set_title('Bicycle RRT* with STL Monitoring')
-        plt.pause(0.01)
-    
-    def draw_rrt(self):
-        """Draw final RRT tree"""
-        plt.figure(2, figsize=(12, 10))
-        plt.clf()
-        ax3d = plt.axes(projection='3d')
-        
-        # Draw selected nodes and their paths
-        for node in self.select_nd:
-            ax3d.scatter(node.x, node.y, node.t, c='k', marker='^', s=50)
-            cn = node
-            while cn.parent is not None:
-                self.plot_line_3d(ax3d, cn)
-                cn = cn.parent
-        
-        # Draw environment
-        for (ox, oy, size) in self.obstacle_list:
-            x, y, z = self.plot_cylinder(ox, oy, size)
-            ax3d.plot_surface(x, y, z, color='b', alpha=0.5)
-        
-        # for k, v in self.task_point['Once'].items():
-        #     for item in v:
-        #         x, y, z = self.plot_cylinder_cons(item[0], item[1],
-        #             (self.rand_area[1][2] - k[1], self.rand_area[1][2] - k[0]), item[2])
-        #         ax3d.plot_surface(x, y, z, color='y', alpha=0.5)
-        
-        ax3d.scatter(self.start.x, self.start.y, 0, c='r', marker='x', s=100)
-        ax3d.set_title('Final Bicycle RRT* Tree')
-        plt.pause(0.01)
-    
-    def draw_path_2D(self, start_point):
-        """Draw 2D path with bicycle model details"""
-        plt.figure(1, figsize=(12, 8))
-        plt.clf()
-        
-        # Find path to start point
-        reach_list = [x for x in self.select_nd 
-                     if self.calc_distance_bicycle(x, start_point) < 10]
-        
-        if len(reach_list) == 0:
-            print('No path is available!')
-            return None
-        
-        # Select best node
-        distances = [np.linalg.norm(node.state.position() - start_point.state.position()) + 
-                    node.cost for node in reach_list]
-        minind = distances.index(min(distances))
-        nearest_select_node = reach_list[minind]
-        
-        # Draw path
-        start_point.parent = nearest_select_node
-        cn = start_point
-        while cn.parent is not None:
-            self.plot_line_2d(cn)
-            # Draw vehicle orientation
-            self.draw_vehicle_2d(cn.state)
-            plt.text(cn.x, cn.y, f"{self.rand_area[1][2] - cn.t:.1f}s\nv={cn.v:.1f}")
-            cn = cn.parent
-        
-        # Draw final node
-        self.draw_vehicle_2d(cn.state)
-        plt.text(cn.x, cn.y, f"{self.rand_area[1][2] - cn.t:.1f}s\nv={cn.v:.1f}")
-        
-        # Draw obstacles
-        for (ox, oy, size) in self.obstacle_list:
-            self.plot_circle_2d(ox, oy, size)
-        
-        # # Draw task points
-        # for k, v in self.task_point['Once'].items():
-        #     for item in v:
-        #         self.plot_circle_2d(item[0], item[1], item[2], color='y')
-        #         plt.text(item[0], item[1], str(k))
-        
-        plt.axis("equal")
-        plt.grid(True)
-        plt.title('Bicycle RRT* Path (2D View)')
-        plt.xlabel('X (m)')
-        plt.ylabel('Y (m)')
-        plt.pause(0.01)
-    
-    def draw_path_3D(self, start_point):
-        """Draw 3D path"""
-        plt.figure(4, figsize=(12, 10))
-        plt.clf()
-        ax3d = plt.axes(projection='3d')
-        
-        # Similar to draw_path_2D but in 3D
-        reach_list = [x for x in self.select_nd 
-                     if self.calc_distance_bicycle(x, start_point) < 10]
-        
-        if len(reach_list) == 0:
-            print('No 3D path available!')
-            return None
-        
-        distances = [np.linalg.norm(node.state.position() - start_point.state.position()) + 
-                    node.cost for node in reach_list]
-        minind = distances.index(min(distances))
-        nearest_select_node = reach_list[minind]
-        
-        ax3d.scatter(start_point.x, start_point.y, start_point.t, c='k', marker='^', s=100)
-        start_point.parent = nearest_select_node
-        cn = start_point
-        while cn.parent is not None:
-            self.plot_line_3d(ax3d, cn)
-            cn = cn.parent
-        
-        # Draw environment in 3D
-        for (ox, oy, size) in self.obstacle_list:
-            x, y, z = self.plot_cylinder(ox, oy, size)
-            ax3d.plot_surface(x, y, z, color='b', alpha=0.5)
-        
-        # for k, v in self.task_point['Once'].items():
-        #     for item in v:
-        #         x, y, z = self.plot_cylinder_cons(item[0], item[1],
-        #             (self.rand_area[1][2] - k[1], self.rand_area[1][2] - k[0]), item[2])
-        #         ax3d.plot_surface(x, y, z, color='y', alpha=0.5)
-        
-        ax3d.scatter(self.start.x, self.start.y, 0, c='r', marker='x', s=100)
-        ax3d.set_title('Bicycle RRT* Path (3D View)')
-        plt.pause(0.01)
-    
-    def draw_vehicle_2d(self, state: BicycleState, color='red', alpha=0.7):
-        """Draw vehicle shape in 2D"""
+    def draw_vehicle_on_ax(self, ax, state: BicycleState, color='red', alpha=0.7):
+        """Draw vehicle shape in 2D on specific axes"""
         corners = self.bicycle_model.get_vehicle_corners(state)
         vehicle_polygon = plt.Polygon(corners, color=color, alpha=alpha)
-        plt.gca().add_patch(vehicle_polygon)
+        ax.add_patch(vehicle_polygon)
         
         # Draw orientation arrow
         arrow_length = 2.0
-        plt.arrow(state.x, state.y,
+        ax.arrow(state.x, state.y,
                  arrow_length * np.cos(state.theta),
                  arrow_length * np.sin(state.theta),
-                 head_width=0.5, head_length=0.3, fc=color, ec=color)
+                 head_width=0.5, head_length=0.3, fc=color, ec=color, alpha=alpha)
     
-    def plot_line_3d(self, ax, node):
-        """Plot 3D line between node and parent"""
-        if node.parent:
-            ax.plot([node.x, node.parent.x], 
-                   [node.y, node.parent.y], 
-                   [node.t, node.parent.t], 'b-', alpha=0.6)
-    
-    def plot_line_2d(self, node):
-        """Plot 2D line between node and parent"""
-        if node.parent:
-            plt.plot([node.x, node.parent.x], 
-                    [node.y, node.parent.y], 'b-', linewidth=2)
-    
+
     def plot_circle_2d(self, x, y, size, color="b"):
-        """Plot 2D circle"""
+        """Plot 2D circle on current axes"""
         deg = list(range(0, 360, 5))
         deg.append(0)
         xl = [x + size * math.cos(np.deg2rad(d)) for d in deg]
         yl = [y + size * math.sin(np.deg2rad(d)) for d in deg]
-        plt.plot(xl, yl, color)
-    
-    def plot_cylinder(self, x, y, size):
-        """Plot cylinder for 3D obstacles"""
-        h = np.linspace(0, self.rand_area[1][2], 100)
-        h.shape = (100, 1)
-        deg = list(range(0, 360, 5))
-        deg.append(0)
-        xl = [x + size * math.cos(np.deg2rad(d)) for d in deg]
-        yl = [y + size * math.sin(np.deg2rad(d)) for d in deg]
-        p = np.ones(len(xl))
-        p.shape = (1, len(xl))
-        z = p * h
-        return np.array(xl), np.array(yl), z
-    
-    def plot_cylinder_cons(self, x, y, bound, size):
-        """Plot constrained cylinder for task points"""
-        h = np.linspace(bound[0], bound[1], 100)
-        h.shape = (100, 1)
-        deg = list(range(0, 360, 5))
-        deg.append(0)
-        xl = [x + size * math.cos(np.deg2rad(d)) for d in deg]
-        yl = [y + size * math.sin(np.deg2rad(d)) for d in deg]
-        p = np.ones(len(xl))
-        p.shape = (1, len(xl))
-        z = p * h
-        return np.array(xl), np.array(yl), z
+        self.ax.plot(xl, yl, color)
 
 
 # ===============================
 # Main Demo Function
 # ===============================
 def main_bicycle_rrt_demo():
-    """Main demonstration of merged bicycle RRT* with STL monitoring"""
-    print("Starting Bicycle RRT* with STL Monitoring Demo")
-    print("=" * 50)
+    """Main demonstration of merged bicycle RRT* with STL monitoring and single window animation"""
+    print("Starting Bicycle RRT* with STL Monitoring Demo (Single Window Animation)")
+    print("=" * 75)
     
     # Use environment and STL from environment.py
     obstacle_list = OBSTACLE_LIST
@@ -784,12 +712,17 @@ def main_bicycle_rrt_demo():
         region_predicates=REGION_PREDICATES
     )
     
+    # Store region predicates for visualization
+    rrt.region_predicates = REGION_PREDICATES
+    
     print(f"Planning with bicycle model:")
     print(f"  Wheelbase: {bicycle_model.wheelbase} m")
     print(f"  Max speed: {bicycle_model.max_speed} m/s")
     print(f"  Max acceleration: {bicycle_model.max_acceleration} m/s²")
     print(f"  Max steering: {bicycle_model.max_steering_angle * 180/np.pi:.1f} degrees")
     print(f"  Start state: x={start_state.x}, y={start_state.y}, θ={start_state.theta:.2f}, v={start_state.v}")
+    print(f"  Planning space: 3D (x, y, t) with time range [0, {rand_area[1][2]}]s")
+    print(f"  Visualization: Single window with real-time updates")
     
     # Run planning
     start_time = time.time()
@@ -797,92 +730,115 @@ def main_bicycle_rrt_demo():
     planning_time = time.time() - start_time
     
     print(f"\nPlanning completed in {planning_time:.2f} seconds")
-    print(f"Generated {len(rrt.node_list)} nodes")
-    print(f"Found {len(rrt.select_nd)} selectable nodes")
+    print(f"Generated {len(rrt.node_list)} nodes in 3D space")
+    print(f"Found {len(rrt.select_nd)} STL-compliant selectable nodes")
+    
+    # Additional analysis
+    if len(rrt.node_list) > 0:
+        max_time = max(node.t for node in rrt.node_list)
+        avg_speed = np.mean([node.v for node in rrt.node_list])
+        print(f"Maximum time reached: {max_time:.2f}s")
+        print(f"Average speed: {avg_speed:.2f} m/s")
     
     # Show final results
     if show_animation:
-        # Keep plots open
+        print("\nAnimation complete! Single window shows:")
+        print("  - Real-time RRT tree growth with time-based coloring")
+        print("  - STL-compliant nodes marked with green stars")
+        print("  - Final optimal path with vehicle dynamics")
+        print("  - Task regions and obstacles")
+        
+        # Keep plot open
+        print("\nClose the plot window to continue...")
         plt.show()
     
     return rrt
 
 
 def run_bicycle_rrt_comparison():
-    """Run comparison between standard RRT and bicycle RRT"""
+    """Run comparison between different bicycle configurations (no animation)"""
     print("\n" + "=" * 60)
-    print("COMPARISON: Standard RRT vs Bicycle RRT* with STL")
+    print("COMPARISON: Different Bicycle Configurations")
     print("=" * 60)
     
     # Same environment for both
     obstacle_list = [(8, 12, 2), (15, 8, 1.5)]
     rand_area = [(0, 0, 0), (20, 20, 15)]
     
-    # Test 1: Standard point robot (simplified)
-    print("\n1. Standard Point Robot RRT:")
-    start_state_simple = BicycleState(x=2, y=2, theta=0, v=5, t=0)
+    configs = [
+        {
+            'name': 'Agile Car',
+            'wheelbase': 2.5,
+            'max_speed': 20.0,
+            'max_acceleration': 5.0,
+            'max_steering': np.pi/3
+        },
+        {
+            'name': 'Standard Car',
+            'wheelbase': 2.7,
+            'max_speed': 15.0,
+            'max_acceleration': 3.0,
+            'max_steering': np.pi/4
+        },
+        {
+            'name': 'Large Vehicle',
+            'wheelbase': 4.0,
+            'max_speed': 10.0,
+            'max_acceleration': 2.0,
+            'max_steering': np.pi/6
+        }
+    ]
     
-    simple_bicycle = BicycleModel(
-        wheelbase=0.1,  # Very small wheelbase = point robot
-        max_speed=20.0,
-        max_acceleration=10.0,
-        max_steering_angle=np.pi
-    )
+    results = {}
     
-    rrt_simple = BicycleRRT(
-        start_state=start_state_simple,
-        obstacle_list=obstacle_list,
-        rand_area=rand_area,
-        bicycle_model=simple_bicycle,
-        max_iter=200
-    )
+    for config in configs:
+        print(f"\nTesting {config['name']}:")
+        
+        bicycle_model = BicycleModel(
+            wheelbase=config['wheelbase'],
+            max_speed=config['max_speed'],
+            max_acceleration=config['max_acceleration'],
+            max_steering_angle=config['max_steering']
+        )
+        
+        start_state = BicycleState(x=2, y=2, theta=0, v=3, t=0)
+        
+        rrt = BicycleRRT(
+            start_state=start_state,
+            obstacle_list=obstacle_list,
+            rand_area=rand_area,
+            bicycle_model=bicycle_model,
+            max_iter=300
+        )
+        
+        start_time = time.time()
+        rrt.planning(animation=False)  # No animation for comparison
+        planning_time = time.time() - start_time
+        
+        results[config['name']] = {
+            'time': planning_time,
+            'nodes': len(rrt.node_list),
+            'valid_paths': len(rrt.select_nd),
+            'success_rate': len(rrt.select_nd) / max(1, len(rrt.node_list)) * 100
+        }
+        
+        print(f"   Time: {planning_time:.2f}s")
+        print(f"   Nodes: {len(rrt.node_list)}")
+        print(f"   Valid paths: {len(rrt.select_nd)}")
+        print(f"   Success rate: {results[config['name']]['success_rate']:.1f}%")
     
-    start_time = time.time()
-    rrt_simple.planning(animation=False)
-    simple_time = time.time() - start_time
+    # Summary
+    print(f"\nSummary:")
+    for name, result in results.items():
+        print(f"   {name}: {result['time']:.2f}s, {result['success_rate']:.1f}% success")
     
-    print(f"   Time: {simple_time:.2f}s, Nodes: {len(rrt_simple.node_list)}")
-    
-    # Test 2: Realistic bicycle model
-    print("\n2. Realistic Bicycle Model RRT:")
-    start_state_bicycle = BicycleState(x=2, y=2, theta=0, v=3, t=0)
-    
-    realistic_bicycle = BicycleModel(
-        wheelbase=2.7,
-        max_speed=12.0,
-        max_acceleration=2.0,
-        max_steering_angle=np.pi/6  # 30 degrees
-    )
-    
-    rrt_bicycle = BicycleRRT(
-        start_state=start_state_bicycle,
-        obstacle_list=obstacle_list,
-        rand_area=rand_area,
-        bicycle_model=realistic_bicycle,
-        max_iter=200
-    )
-    
-    start_time = time.time()
-    rrt_bicycle.planning(animation=False)
-    bicycle_time = time.time() - start_time
-    
-    print(f"   Time: {bicycle_time:.2f}s, Nodes: {len(rrt_bicycle.node_list)}")
-    
-    # Analysis
-    print(f"\nAnalysis:")
-    print(f"   Bicycle model is {bicycle_time/simple_time:.1f}x slower due to:")
-    print(f"   - Nonlinear dynamics integration")
-    print(f"   - Vehicle shape collision checking")
-    print(f"   - Kinematic constraints")
-    print(f"   - More complex state space (x, y, θ, v)")
-    
-    return rrt_simple, rrt_bicycle
+    return results
 
 
-def demonstrate_stl_monitoring():
-    """Demonstrate STL monitoring capabilities"""
+def demonstrate_stl_monitoring_2d():
+    """Demonstrate STL monitoring capabilities with single window visualization"""
     print("\n" + "=" * 60)
-    print("STL MONITORING DEMONSTRATION")
+    print("STL MONITORING DEMONSTRATION (Single Window)")
     print("=" * 60)
     
     # Create scenario with time-sensitive tasks
@@ -897,25 +853,34 @@ def demonstrate_stl_monitoring():
         obstacle_list=obstacle_list,
         rand_area=rand_area,
         bicycle_model=bicycle_model,
-        max_iter=150
+        max_iter=500
     )
     
-    # print("STL Task Points:")
-    # for time_bound, points in rrt_stl.task_point['Once'].items():
-    #     time_start = rand_area[1][2] - time_bound[1]
-    #     time_end = rand_area[1][2] - time_bound[0]
-    #     print(f"   Time [{time_start}, {time_end}]: Visit {points}")
+    rrt_stl.region_predicates = REGION_PREDICATES
     
-    # Run with STL monitoring
+    print("STL Formula being monitored:")
+    print(f"   {STL_FORMULA}")
+    print("Region predicates:")
+    for name, (x, y, r) in REGION_PREDICATES.items():
+        print(f"   {name}: center=({x}, {y}), radius={r}")
+    
+    # Run with STL monitoring and animation
     start_time = time.time()
-    rrt_stl.planning(animation=False)
+    rrt_stl.planning(animation=show_animation)
     stl_time = time.time() - start_time
     
     print(f"\nSTL Planning Results:")
     print(f"   Planning time: {stl_time:.2f}s")
     print(f"   Total nodes: {len(rrt_stl.node_list)}")
     print(f"   STL-compliant nodes: {len(rrt_stl.select_nd)}")
-    print(f"   Success rate: {len(rrt_stl.select_nd)/len(rrt_stl.node_list)*100:.1f}%")
+    if len(rrt_stl.node_list) > 0:
+        success_rate = len(rrt_stl.select_nd) / len(rrt_stl.node_list) * 100
+        print(f"   STL compliance rate: {success_rate:.1f}%")
+    
+    # Analyze time distribution of compliant nodes
+    if len(rrt_stl.select_nd) > 0:
+        compliant_times = [node.t for node in rrt_stl.select_nd]
+        print(f"   Compliant node times: {min(compliant_times):.1f}s to {max(compliant_times):.1f}s")
     
     return rrt_stl
 
@@ -925,8 +890,24 @@ if __name__ == '__main__':
     random.seed(42)
     np.random.seed(42)
     
-    print("BICYCLE RRT* WITH STL MONITORING")
-    print("================================")
+    print("BICYCLE RRT* WITH SINGLE WINDOW ANIMATION")
+    print("=" * 45)
+    print("Key Features:")
+    print("- 3D planning space (x, y, time) for STL temporal logic")
+    print("- Single window animation with real-time updates")
+    print("- Bicycle kinematic model with realistic constraints")
+    print("- STL transducer monitoring for temporal requirements")
+    print("- Time-based coloring and progress indicators")
+    print()
     
     # Main demonstration
     main_rrt = main_bicycle_rrt_demo()
+    
+    # # Optional: Run additional demonstrations
+    # if input("\nRun comparison demo? (y/n): ").lower() == 'y':
+    #     comparison_results = run_bicycle_rrt_comparison()
+    
+    # if input("\nRun STL monitoring demo with animation? (y/n): ").lower() == 'y':
+    #     stl_demo = demonstrate_stl_monitoring_2d()
+    
+    print("\nDemo completed!")
