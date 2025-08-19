@@ -12,20 +12,16 @@ import torch.nn as nn
 # RRT + STL + PINN-MPC integration pipeline
 # --------------------------------------------
 
-def generate_rrt_stl_path(env_cfg=None):
+
+def generate_rrt_stl_path():
     """
-    Generate an STL-compliant RRT path using the unified EnvironmentConfig.
+    Generate an STL-compliant RRT path using the canonical environment.py globals.
     """
-    if env_cfg is None:
-        # Default config if not provided
-        env_cfg = EnvironmentConfig(
-            xlim=(0, 15), ylim=(0, 15),
-            obstacles=[(7, 7)],
-            start=[5.5, 6.5, 0.0, 2.0],
-            goal=[10, 10, 0.0, 2.0],
-            region_predicates={},
-            stl_formula=None
-        )
+    from environment import OBSTACLE_LIST, RAND_AREA, REGION_PREDICATES, STL_FORMULA
+    from stl_rrt import BicycleRRT, BicycleState, BicycleModel
+
+    # Initial state: [x, y, theta, v, t]
+    start_state = BicycleState(x=5.5, y=6.5, theta=0.0, v=2.0, t=0.0)
 
     # Create bicycle model
     bicycle_model = BicycleModel(
@@ -35,25 +31,21 @@ def generate_rrt_stl_path(env_cfg=None):
         max_steering_angle=np.pi/4
     )
 
-    # Initial state: [x, y, theta, v, t]
-    start = env_cfg.start if hasattr(env_cfg, 'start') else [5.5, 6.5, 0.0, 2.0]
-    start_state = BicycleState(x=start[0], y=start[1], theta=start[2], v=start[3], t=0.0)
-
     # Create RRT planner with STL monitoring
     rrt = BicycleRRT(
         start_state=start_state,
-        obstacle_list=env_cfg.obstacles,
-        rand_area=(env_cfg.xlim, env_cfg.ylim),
+        obstacle_list=OBSTACLE_LIST,
+        rand_area=RAND_AREA,
         bicycle_model=bicycle_model,
         expand_dis=3.0,
         path_resolution=0.3,
         max_iter=1000,
         control_duration=1.0,
         num_control_samples=7,
-        stl_formula=getattr(env_cfg, 'stl_formula', None),
-        region_predicates=getattr(env_cfg, 'region_predicates', {})
+        stl_formula=STL_FORMULA,
+        region_predicates=REGION_PREDICATES
     )
-    rrt.region_predicates = getattr(env_cfg, 'region_predicates', {})
+    rrt.region_predicates = REGION_PREDICATES
     rrt.planning(animation=False)
 
     # Extract STL-compliant leaf node path (if any)
@@ -72,7 +64,6 @@ def generate_rrt_stl_path(env_cfg=None):
     # Convert to numpy array (N, 5): [x, y, theta, v, t]
     path_arr = np.array([[n.x, n.y, n.theta, n.v, n.t] for n in path_nodes], dtype=np.float32)
     return path_arr
-
 
 # ===============================
 # RRT-informed MPC + PINN control loop
@@ -241,46 +232,27 @@ def rrt_pinn_mpc_control_loop(rrt_paths, trained_pinn_model, initial_state, step
         "references": np.array(refs_logged, dtype=object)
     }
 
+
 if __name__ == "__main__":
-    # 1. Set up environment config
-    env_cfg = EnvironmentConfig(
-        xlim=(0, 15), ylim=(0, 15),
-        obstacles=[(7, 7)],
-        start=[5.5, 6.5, 0.0, 2.0],
-        goal=[10, 10, 0.0, 2.0],
-        region_predicates={},
-        stl_formula=None
-    )
-
-    # 2. Generate STL-compliant RRT path
+    # 1. Generate STL-compliant RRT path
     print("Generating STL-compliant RRT path...")
-    try:
-        rrt_path = generate_rrt_stl_path(env_cfg)  # shape (N, 5)
-        print(f"RRT path shape: {rrt_path.shape}")
-    except Exception as e:
-        print("Failed to generate STL-compliant RRT path:", e)
-        exit(1)
+    rrt_path = generate_rrt_stl_path()  # shape (N, 5)
+    print(f"RRT path shape: {rrt_path.shape}")
 
-    # 3. Load trained PINN model (robust to missing file or mismatch)
+    # 2. Load trained PINN model using PINN_PI_Module from test_PINN_PI.py
     print("Loading trained PINN model...")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    from test_PINN_PI import PINN_PI_Module
     checkpoint_path = 'trained_model.pt'
     try:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        # Try to infer model args from checkpoint if possible, else use default
-        if 'model_args' in checkpoint:
-            pinn_model = DNN_PI(*checkpoint['model_args']).to(device)
-        else:
-            pinn_model = DNN_PI(7, 512, [256, 256, 4], [9, 9]).to(device)
-        pinn_model.load_state_dict(checkpoint['model_state_dict'])
-        pinn_model.eval()
+        pinn_module = PINN_PI_Module(seed=0, gpu=0, checkpoint_path=checkpoint_path)
+        pinn_model = pinn_module.get_model()
         print("Loaded trained PINN model from", checkpoint_path)
     except Exception as e:
         print("Warning: Could not load trained_model.pt, using untrained PINN. Error:", e)
-        pinn_model = DNN_PI(7, 512, [256, 256, 4], [9, 9]).to(device)
-        pinn_model.eval()
+        pinn_module = PINN_PI_Module(seed=0, gpu=0)
+        pinn_model = pinn_module.get_model()
 
-    # 4. Run closed-loop control using RRT reference and PINN-MPC
+    # 3. Run closed-loop control using RRT reference and PINN-MPC
     print("Running closed-loop control with RRT reference and PINN-MPC...")
     initial_state = rrt_path[0, :4]  # [x, y, theta, v]
     rrt_paths = [rrt_path]
@@ -294,7 +266,7 @@ if __name__ == "__main__":
         use_true_simulator=True
     )
 
-    # 5. Plot results
+    # 4. Plot results
     print("Plotting closed-loop trajectory...")
     states = out['states']
     plt.figure(figsize=(10, 6))

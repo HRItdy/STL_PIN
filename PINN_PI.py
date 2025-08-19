@@ -27,8 +27,6 @@ from DNN import DNN_PI
 from thop import profile
 
 
-
-
 # device = 'cuda'
 
 # Bicycle model parameters
@@ -92,7 +90,6 @@ def generate_training_batch(batch_size=64, T=1.0, dt=0.05):
 
     return torch.cat(inputs, dim=0), torch.cat(targets, dim=0)
 
-
 batch_size = 50
 T = 5.0
 dt = 0.05
@@ -130,8 +127,6 @@ def PINN_PI(seed=0, gpu=0):
     # torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(), 'MSE': mse}, 'train_model.pt')
 
     return mse_all, mse_list
-
-
 
 # Infer
 def infer(model, x_train_all, y_train_all, x_train_ic, y_train_ic, n_nodes_list, device):
@@ -239,9 +234,6 @@ def infer(model, x_train_all, y_train_all, x_train_ic, y_train_ic, n_nodes_list,
 
 
     return mse_all, mse_list
-
-
-
 
 if __name__ == "__main__":
 
