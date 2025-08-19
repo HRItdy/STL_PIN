@@ -5,14 +5,12 @@ import matplotlib.pyplot as plt
 import torch
 from stl_rrt import BicycleRRT, BicycleState, BicycleControl, BicycleModel
 from environment import EnvironmentConfig
-from test_PINN_PI import DNN_PI, rk4_step
+from PINN_PI import PINN_PI
 import torch.nn as nn
 
 # --------------------------------------------
 # RRT + STL + PINN-MPC integration pipeline
 # --------------------------------------------
-
-
 def generate_rrt_stl_path():
     """
     Generate an STL-compliant RRT path using the canonical environment.py globals.
@@ -68,38 +66,11 @@ def generate_rrt_stl_path():
 # ===============================
 # RRT-informed MPC + PINN control loop
 # ===============================
-import numpy as np
-import torch
 from scipy.optimize import minimize
-
-# Wrapper to use the trained PINN for one-step prediction with constant control over dt
-class PINNStepModel:
-    def __init__(self, pinn_model):
-        self.model = pinn_model.eval()
-
-    @torch.no_grad()
-    def predict_next_state(self, x, u, dt, substeps: int = 1):
-        """
-        Predict x(t+dt) from x(t) using the PINN by integrating in 'substeps' with constant u.
-        The PINN takes (t, x0, u) -> x(t). We emulate small-time propagation.
-        """
-        if isinstance(x, np.ndarray):
-            x = torch.tensor(x, dtype=torch.float32)
-        if isinstance(u, np.ndarray):
-            u = torch.tensor(u, dtype=torch.float32)
-        x_curr = x.clone()
-        ds = dt / substeps
-        for _ in range(substeps):
-            t_in = torch.tensor([[ds]], dtype=torch.float32)
-            x0_in = x_curr.unsqueeze(0)
-            u_in = u.unsqueeze(0)
-            x_next = self.model(t_in, x0_in, u_in).squeeze(0)
-            x_curr = x_next
-        return x_curr
 
 # Simple reference-tracking MPC that uses the PINN for rollout
 class ReferenceTrackingMPC:
-    def __init__(self, pinn_stepper: PINNStepModel, horizon=15, dt=0.1,
+    def __init__(self, pinn_stepper, horizon=15, dt=0.1,
                  u_bounds=((-1.0, 1.0), (-0.5, 0.5)), w_state=1.0, w_ctrl=1e-3, w_smooth=1e-2):
         self.pinn = pinn_stepper
         self.H = horizon
@@ -176,8 +147,7 @@ def sample_reference_from_path(path: np.ndarray, start_idx: int, horizon: int, d
 
 # --------- Closed-loop control using RRT reference + PINN-MPC ---------
 
-def rrt_pinn_mpc_control_loop(rrt_paths, trained_pinn_model, initial_state, steps=80, horizon=15, dt=0.1,
-                              use_true_simulator=True):
+def rrt_pinn_mpc_control_loop(rrt_paths, trained_pinn_model, initial_state, steps=80, horizon=15, dt=0.1):
     """
     rrt_paths: list of numpy arrays, each of shape (N_i, 5) with columns [x,y,theta,v,t]
     trained_pinn_model: the PINN instance previously trained
@@ -185,8 +155,7 @@ def rrt_pinn_mpc_control_loop(rrt_paths, trained_pinn_model, initial_state, step
     use_true_simulator: if True, propagate the real system with rk4_step; else use PINN for propagation
     Returns history dict with states, controls, references.
     """
-    pinn_stepper = PINNStepModel(trained_pinn_model)
-    mpc = ReferenceTrackingMPC(pinn_stepper, horizon=horizon, dt=dt)
+    mpc = ReferenceTrackingMPC(trained_pinn_model, horizon=horizon, dt=dt)
 
     x = np.array(initial_state, dtype=np.float32)
     states = [x.copy()]
@@ -211,14 +180,9 @@ def rrt_pinn_mpc_control_loop(rrt_paths, trained_pinn_model, initial_state, step
         u0 = u_seq[0]
         controls.append(u0.copy())
 
-        # propagate the system (choose ground-truth or PINN)
-        if use_true_simulator:
-            x_t = torch.tensor(x, dtype=torch.float32)
-            u_t = torch.tensor(u0, dtype=torch.float32)
-            x_next = rk4_step(x_t, u_t, dt).detach().numpy()
-        else:
-            x_next = pinn_stepper.predict_next_state(torch.tensor(x, dtype=torch.float32),
-                                                     torch.tensor(u0, dtype=torch.float32), dt).detach().numpy()
+        # propagate the system using the PINN model's predict_next_state
+        x_next = trained_pinn_model.predict_next_state(torch.tensor(x, dtype=torch.float32),
+                                                      torch.tensor(u0, dtype=torch.float32), dt).detach().cpu().numpy()
         x = x_next
         states.append(x.copy())
 
@@ -239,18 +203,15 @@ if __name__ == "__main__":
     rrt_path = generate_rrt_stl_path()  # shape (N, 5)
     print(f"RRT path shape: {rrt_path.shape}")
 
-    # 2. Load trained PINN model using PINN_PI_Module from test_PINN_PI.py
+    # 2. Load trained PINN model using PINN_PI from PINN_PI.py
     print("Loading trained PINN model...")
-    from test_PINN_PI import PINN_PI_Module
     checkpoint_path = 'trained_model.pt'
     try:
-        pinn_module = PINN_PI_Module(seed=0, gpu=0, checkpoint_path=checkpoint_path)
-        pinn_model = pinn_module.get_model()
+        pinn_model = PINN_PI(checkpoint_path=checkpoint_path)
         print("Loaded trained PINN model from", checkpoint_path)
     except Exception as e:
         print("Warning: Could not load trained_model.pt, using untrained PINN. Error:", e)
-        pinn_module = PINN_PI_Module(seed=0, gpu=0)
-        pinn_model = pinn_module.get_model()
+        pinn_model = PINN_PI()
 
     # 3. Run closed-loop control using RRT reference and PINN-MPC
     print("Running closed-loop control with RRT reference and PINN-MPC...")
