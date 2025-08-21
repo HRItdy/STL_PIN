@@ -127,14 +127,50 @@ class PINN_PI:
     def get_model(self):
         return self.model
     
+    def forward_nn(self, t, x0, u_control):
+        """
+        Pure forward NN pass (no physics, no grads). 
+        Safe for MPC rollout.
+        """
+        self.model.eval()
+
+        # Convert to tensor if needed
+        if isinstance(t, (int, float)):
+            t = torch.tensor([[t]], dtype=torch.float32)
+        if isinstance(x0, np.ndarray):
+            x0 = torch.tensor(x0, dtype=torch.float32)
+        if isinstance(u_control, np.ndarray):
+            u_control = torch.tensor(u_control, dtype=torch.float32)
+
+        # Ensure correct shape
+        if t.dim() == 0:
+            t = t.unsqueeze(0).unsqueeze(0)
+        if x0.dim() == 1:
+            x0 = x0.unsqueeze(0)
+        if u_control.dim() == 1:
+            u_control = u_control.unsqueeze(0)
+
+        # Move all to self.device
+        t = t.to(self.device)
+        x0 = x0.to(self.device)
+        u_control = u_control.to(self.device)
+
+        # just concatenate and forward through NN
+        with torch.no_grad():
+            f = self.model(torch.cat([t, x0, u_control], dim=1), flag=0)
+        return f.squeeze(0).cpu()
+    
     @torch.no_grad()
-    def infer(self, t, x0, u_control):
+    def infer(self, t, x0, u_control, physics=True):
         """
         PINN inference for a single step using the physics-informed approach from first code
         t: time (scalar or tensor)
         x0: initial state [x, y, theta, v] 
         u_control: control input [a, delta]
         """
+        if not physics:
+            return self.forward_nn(t, x0, u_control)
+        
         self.model.eval()
         
         # Convert inputs to tensors if needed
@@ -255,7 +291,7 @@ class PINN_PI:
         x_curr = x
         ds = dt / substeps
         for _ in range(substeps):
-            x_next = self.infer(ds, x_curr, u)
+            x_next = self.infer(ds, x_curr, u, physics=False)
             x_curr = x_next
         return x_curr
     
@@ -417,4 +453,3 @@ if __name__ == "__main__":
 
     gpu = 0
     loss_min, mse_min = PINN_PI(seed=0, gpu=0)
-
