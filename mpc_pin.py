@@ -444,7 +444,7 @@ if __name__ == "__main__":
     pinn_model = PINN_PI(checkpoint_path=checkpoint_path)
     x0 = [0.0, 0.0, 0.0, 1.0]  # initial state: [x, y, theta, v]
     u = [1.0, 0.1]             # constant control: [a, delta]
-    test_pinn_accuracy(pinn_model, x0, u, dt=0.1, steps=20)
+    test_pinn_accuracy(pinn_model, x0, u, dt=0.05, steps=20)
     print("PINN accuracy test completed.")
     # # 1. Generate and interpolate STL-compliant RRT path
     # print("Generating and interpolating STL-compliant RRT path...")

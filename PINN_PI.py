@@ -26,7 +26,6 @@ import math
 from DNN import DNN_PI
 from thop import profile
 
-
 # device = 'cuda'
 
 # Bicycle model parameters
@@ -90,115 +89,63 @@ def generate_training_batch(batch_size=64, T=1.0, dt=0.05):
 
     return torch.cat(inputs, dim=0), torch.cat(targets, dim=0)
 
-class PINN_PI:
-    """
-    PINN module that integrates the Physics-Informed training and inference
-    """
-    def __init__(self, seed=0, gpu=0, checkpoint_path=None):
-        torch.cuda.set_device(gpu)
-        cudnn.benchmark = True
-        torch.manual_seed(seed)
-        cudnn.enabled = True
-        torch.cuda.manual_seed(seed)
-        
-        self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        
-        # Model architecture (from first code)
-        input_dim = 7
-        n_nodes_first_layer = 512
-        self.n_nodes_list = [256, 256, 4]
-        i_ac_list = [9, 9]
-        
-        self.model = DNN_PI(input_dim, n_nodes_first_layer, self.n_nodes_list, i_ac_list).to(self.device)
-        
-        if checkpoint_path and os.path.exists(checkpoint_path):
-            self.load_checkpoint(checkpoint_path)
-        
-    def load_checkpoint(self, checkpoint_path):
-        """Load trained model checkpoint"""
-        try:
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            self.model.eval()
-            print(f"Loaded PINN model from {checkpoint_path}")
-        except Exception as e:
-            print(f"Warning: Could not load checkpoint {checkpoint_path}: {e}")
+batch_size = 50
+T = 5.0
+dt = 0.05
+x_train, y_train = generate_training_batch(batch_size, T, dt)
+x_train_all, y_train_all = x_train.detach().cpu().numpy(), y_train.detach().cpu().numpy()
+_ic = x_train_all[:, 0] == 0
+x_train_ic = x_train_all[_ic]
+y_train_ic = y_train_all[_ic]
+
+
+def PINN_PI(seed=0, gpu=0):
+
+    torch.cuda.set_device(gpu)
+    cudnn.benchmark = True
+    torch.manual_seed(seed)
+    cudnn.enabled = True
+    torch.cuda.manual_seed(seed)
+
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    input_dim = 7
+    n_nodes_first_layer = 512
+    n_nodes_list = [256, 256, 4]
+    i_ac_list = [9, 9]
+
+
+    model = DNN_PI(input_dim, n_nodes_first_layer, n_nodes_list, i_ac_list).to(device)
+
+    checkpoint = torch.load('trained_model.pt')
+    model.load_state_dict(checkpoint['model_state_dict'])
     
-    def get_model(self):
-        return self.model
-    
-    def forward_nn(self, t, x0, u_control):
-        """
-        Pure forward NN pass (no physics, no grads). 
-        Safe for MPC rollout.
-        """
-        self.model.eval()
+    mse_all, mse_list = infer(model, x_train_all, y_train_all, x_train_ic, y_train_ic, n_nodes_list, device)
+        
+    # # save model
+    # torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(), 'MSE': mse}, 'train_model.pt')
 
-        # Convert to tensor if needed
-        if isinstance(t, (int, float)):
-            t = torch.tensor([[t]], dtype=torch.float32)
-        if isinstance(x0, np.ndarray):
-            x0 = torch.tensor(x0, dtype=torch.float32)
-        if isinstance(u_control, np.ndarray):
-            u_control = torch.tensor(u_control, dtype=torch.float32)
+    return mse_all, mse_list
 
-        # Ensure correct shape
-        if t.dim() == 0:
-            t = t.unsqueeze(0).unsqueeze(0)
-        if x0.dim() == 1:
-            x0 = x0.unsqueeze(0)
-        if u_control.dim() == 1:
-            u_control = u_control.unsqueeze(0)
+# Infer
+def infer(model, x_train_all, y_train_all, x_train_ic, y_train_ic, n_nodes_list, device):
+    model.eval()
+    flag = 1
+    # x_train_all = torch.tensor(x_train_all).to(device).float()
+    # y_train_all = torch.tensor(y_train_all).to(device).float()
+    # x_train_ic = torch.tensor(x_train_ic).to(device).float()
+    y_train_ic = torch.tensor(y_train_ic).to(device).float()
+    mse_list = []
+    mse_all = 0
 
-        # Move all to self.device
-        t = t.to(self.device)
-        x0 = x0.to(self.device)
-        u_control = u_control.to(self.device)
+    for i_b in np.arange(batch_size):
+        t = torch.tensor(x_train_all[i_b*(int(T/dt) + 1):(i_b + 1)*(int(T/dt) + 1), 0:1], requires_grad=True).to(device).float()
+        x0 = torch.tensor(x_train_all[i_b*(int(T/dt) + 1):(i_b + 1)*(int(T/dt) + 1), 1:5], requires_grad=True).to(device).float()
+        u_control = torch.tensor(x_train_all[i_b*(int(T/dt) + 1):(i_b + 1)*(int(T/dt) + 1), 5:7], requires_grad=True).to(device).float()
+        label = torch.tensor(y_train_all[i_b*(int(T/dt) + 1):(i_b + 1)*(int(T/dt) + 1), :]).to(device).float()
 
-        # just concatenate and forward through NN
-        with torch.no_grad():
-            f = self.model(torch.cat([t, x0, u_control], dim=1), flag=0)
-        return f.squeeze(0).cpu()
-    
-    @torch.no_grad()
-    def infer(self, t, x0, u_control, physics=True):
-        """
-        PINN inference for a single step using the physics-informed approach from first code
-        t: time (scalar or tensor)
-        x0: initial state [x, y, theta, v] 
-        u_control: control input [a, delta]
-        """
-        if not physics:
-            return self.forward_nn(t, x0, u_control)
-        
-        self.model.eval()
-        
-        # Convert inputs to tensors if needed
-        if isinstance(t, (int, float)):
-            t = torch.tensor([[t]], dtype=torch.float32, device=self.device, requires_grad=True)
-        if isinstance(x0, np.ndarray):
-            x0 = torch.tensor(x0, dtype=torch.float32, device=self.device, requires_grad=True)
-        if isinstance(u_control, np.ndarray):
-            u_control = torch.tensor(u_control, dtype=torch.float32, device=self.device, requires_grad=True)
-        
-        # Ensure proper shapes
-        if t.dim() == 0:
-            t = t.unsqueeze(0).unsqueeze(0)
-        if x0.dim() == 1:
-            x0 = x0.unsqueeze(0)
-        if u_control.dim() == 1:
-            u_control = u_control.unsqueeze(0)
-        
-        # Move to device
-        t = t.to(self.device)
-        x0 = x0.to(self.device)
-        u_control = u_control.to(self.device)
-        
-        # Get neural network output f
-        flag = 1
-        f = self.model(torch.cat([t, x0, u_control], dim=1), flag)
-        
-        # Compute gradients for physics-informed loss (similar to first code)
+        f = model(torch.cat([t, x0, u_control], dim=1), flag)
+
         f_t_list = []
         for i in range(f.shape[1]):
             grad_i = torch.autograd.grad(
@@ -209,247 +156,83 @@ class PINN_PI:
             )[0]
             f_t_list.append(grad_i)
         f_t = torch.cat(f_t_list, dim=1)
-        
-        # Physics-informed inference using linear system solve (from first code)
+
         n_e = 4
         n_s = t.shape[0]
-        n_nodes = self.n_nodes_list[-2]  # 256
-        
+        n_nodes = n_nodes_list[-2]
+        L = 2.5  # wheelbase
         a = u_control[:, 0:1]
         delta = u_control[:, 1:2]
-        
-        # Initial condition constraint
-        ic_A1 = torch.zeros((1, n_e*n_nodes)).to(self.device)
+
+        # IC
+        ic_A1 = torch.zeros((1, n_e*n_nodes)).to(device)
         ic_A1[:, 0*n_nodes:1*n_nodes] = f[0:1]
-        
-        ic_A2 = torch.zeros((1, n_e*n_nodes)).to(self.device)
+
+        ic_A2 = torch.zeros((1, n_e*n_nodes)).to(device)
         ic_A2[:, 1*n_nodes:2*n_nodes] = f[0:1]
-        
-        ic_A3 = torch.zeros((1, n_e*n_nodes)).to(self.device)
+
+        ic_A3 = torch.zeros((1, n_e*n_nodes)).to(device)
         ic_A3[:, 2*n_nodes:3*n_nodes] = f[0:1]
-        
-        ic_A4 = torch.zeros((1, n_e*n_nodes)).to(self.device)
+
+        ic_A4 = torch.zeros((1, n_e*n_nodes)).to(device)
         ic_A4[:, 3*n_nodes:4*n_nodes] = f[0:1]
-        
+
         ic_A = torch.vstack([ic_A1, ic_A2, ic_A3, ic_A4])
-        ic_b = x0[0].reshape(-1, 1)  # Initial state
-        
-        # Iterative solution for nonlinear PDE (from first code)
-        initial_guess_value = torch.tensor(0.0).to(self.device)
-        for i in range(6):  # 6 iterations as in original code
-            # PDE constraints
+        ic_b = y_train_ic[i_b].reshape(-1, 1)
+
+        initial_guess_value = torch.tensor(0)
+        for i in range(6):
+            # PDE (nonlinear)
             if i == 0:
                 theta = initial_guess_value
             else:
                 theta = f @ w_PI[2*n_nodes:3*n_nodes, :]
-            
-            pde_A1 = torch.zeros((n_s, n_e*n_nodes)).to(self.device)
+
+            pde_A1 = torch.zeros((n_s, n_e*n_nodes)).to(device)
             pde_A1[:, 0*n_nodes:1*n_nodes] = f_t
             pde_A1[:, 3*n_nodes:4*n_nodes] = -f * torch.cos(theta)
-            
-            pde_A2 = torch.zeros((n_s, n_e*n_nodes)).to(self.device)
+
+            pde_A2 = torch.zeros((n_s, n_e*n_nodes)).to(device)
             pde_A2[:, 1*n_nodes:2*n_nodes] = f_t
             pde_A2[:, 3*n_nodes:4*n_nodes] = -f * torch.sin(theta)
-            
-            pde_A3 = torch.zeros((n_s, n_e*n_nodes)).to(self.device)
+
+            pde_A3 = torch.zeros((n_s, n_e*n_nodes)).to(device)
             pde_A3[:, 2*n_nodes:3*n_nodes] = f_t
             pde_A3[:, 3*n_nodes:4*n_nodes] = -f / L * torch.tan(delta)
-            
-            pde_A4 = torch.zeros((n_s, n_e*n_nodes)).to(self.device)
+
+            pde_A4 = torch.zeros((n_s, n_e*n_nodes)).to(device)
             pde_A4[:, 3*n_nodes:4*n_nodes] = f_t
-            
+
             pde_A = torch.vstack([pde_A1, pde_A2, pde_A3, pde_A4])
-            
-            pde_b = torch.zeros((pde_A.shape[0], 1)).to(self.device)
+
+            pde_b = torch.zeros((pde_A.shape[0], 1)).to(device)
             pde_b[3*n_s:4*n_s, :] = a
-            
-            # Combine IC and PDE constraints
+
             A = torch.vstack([ic_A, pde_A])
             b = torch.vstack([ic_b, pde_b])
-            
-            # Regularized least squares solution
+
             reg = 1e-6
+
             A = A.detach().cpu().numpy()
             b = b.detach().cpu().numpy()
             w_PI = np.linalg.inv(reg*np.eye(A.shape[1]) + (A.T @ A)) @ A.T @ b
-            w_PI = torch.tensor(w_PI, dtype=torch.float32).to(self.device)
-        
-        # Extract predictions
+            w_PI = torch.tensor(w_PI).float().to(device)
+            
         pred1 = f @ w_PI[0*n_nodes:1*n_nodes, :]
         pred2 = f @ w_PI[1*n_nodes:2*n_nodes, :]
         pred3 = f @ w_PI[2*n_nodes:3*n_nodes, :]
         pred4 = f @ w_PI[3*n_nodes:4*n_nodes, :]
         pred_all = torch.hstack([pred1, pred2, pred3, pred4])
         
-        return pred_all.squeeze(0).detach().cpu()
+        # mse
+        mse = torch.mean((label - pred_all) ** 2)
+        mse_list.append(mse)
+        mse_all = mse_all + mse
     
-    def predict_next_state(self, x, u, dt, substeps: int = 1):
-        """
-        Predict x(t+dt) from x(t) using the PINN by integrating in 'substeps' with constant u.
-        This wraps the infer() method for single-step prediction.
-        """
-        x_curr = x
-        ds = dt / substeps
-        for _ in range(substeps):
-            x_next = self.infer(ds, x_curr, u, physics=False)
-            x_curr = x_next
-        return x_curr
-    
-if __name__ == "__main__":
-    gpu = 0
-    pred = PINN_PI(seed=0, gpu=gpu, checkpoint_path='trained_model.pt').infer(
-        t=torch.tensor(0.0),
-        x0=torch.tensor([0.0, 0.0, 0.0, 1.0]),
-        u_control=torch.tensor([1.0, 0.1])
-    )
-    print(pred)
-
-# batch_size = 50
-# T = 5.0
-# dt = 0.05
-# x_train, y_train = generate_training_batch(batch_size, T, dt)
-# x_train_all, y_train_all = x_train.detach().cpu().numpy(), y_train.detach().cpu().numpy()
-# _ic = x_train_all[:, 0] == 0
-# x_train_ic = x_train_all[_ic]
-# y_train_ic = y_train_all[_ic]
-
-
-# def PINN_PI(seed=0, gpu=0):
-
-#     torch.cuda.set_device(gpu)
-#     cudnn.benchmark = True
-#     torch.manual_seed(seed)
-#     cudnn.enabled = True
-#     torch.cuda.manual_seed(seed)
-
-#     device = torch.device(f"cuda:{torch.cuda.current_device()}")
-
-#     input_dim = 7
-#     n_nodes_first_layer = 512
-#     n_nodes_list = [256, 256, 4]
-#     i_ac_list = [9, 9]
-
-
-#     model = DNN_PI(input_dim, n_nodes_first_layer, n_nodes_list, i_ac_list).to(device)
-
-#     checkpoint = torch.load('/home/weiz/Astar_Work/PINN_Control/Script/trained_model.pt')
-#     model.load_state_dict(checkpoint['model_state_dict'])
-    
-#     mse_all, mse_list = infer(model, x_train_all, y_train_all, x_train_ic, y_train_ic, n_nodes_list, device)
-        
-#     # # save model
-#     # torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(), 'MSE': mse}, 'train_model.pt')
-
-#     return mse_all, mse_list
-
-# # Infer
-# def infer(model, x_train_all, y_train_all, x_train_ic, y_train_ic, n_nodes_list, device):
-#     model.eval()
-#     flag = 1
-#     # x_train_all = torch.tensor(x_train_all).to(device).float()
-#     # y_train_all = torch.tensor(y_train_all).to(device).float()
-#     # x_train_ic = torch.tensor(x_train_ic).to(device).float()
-#     y_train_ic = torch.tensor(y_train_ic).to(device).float()
-#     mse_list = []
-#     mse_all = 0
-
-#     for i_b in np.arange(batch_size):
-#         t = torch.tensor(x_train_all[i_b*(int(T/dt) + 1):(i_b + 1)*(int(T/dt) + 1), 0:1], requires_grad=True).to(device).float()
-#         x0 = torch.tensor(x_train_all[i_b*(int(T/dt) + 1):(i_b + 1)*(int(T/dt) + 1), 1:5], requires_grad=True).to(device).float()
-#         u_control = torch.tensor(x_train_all[i_b*(int(T/dt) + 1):(i_b + 1)*(int(T/dt) + 1), 5:7], requires_grad=True).to(device).float()
-#         label = torch.tensor(y_train_all[i_b*(int(T/dt) + 1):(i_b + 1)*(int(T/dt) + 1), :]).to(device).float()
-
-#         f = model(torch.cat([t, x0, u_control], dim=1), flag)
-
-#         f_t_list = []
-#         for i in range(f.shape[1]):
-#             grad_i = torch.autograd.grad(
-#                 f[:, i:i+1], t,
-#                 grad_outputs=torch.ones_like(f[:, i:i+1]),
-#                 retain_graph=True,
-#                 create_graph=True
-#             )[0]
-#             f_t_list.append(grad_i)
-#         f_t = torch.cat(f_t_list, dim=1)
-
-#         n_e = 4
-#         n_s = t.shape[0]
-#         n_nodes = n_nodes_list[-2]
-#         L = 2.5  # wheelbase
-#         a = u_control[:, 0:1]
-#         delta = u_control[:, 1:2]
-
-#         # IC
-#         ic_A1 = torch.zeros((1, n_e*n_nodes)).to(device)
-#         ic_A1[:, 0*n_nodes:1*n_nodes] = f[0:1]
-
-#         ic_A2 = torch.zeros((1, n_e*n_nodes)).to(device)
-#         ic_A2[:, 1*n_nodes:2*n_nodes] = f[0:1]
-
-#         ic_A3 = torch.zeros((1, n_e*n_nodes)).to(device)
-#         ic_A3[:, 2*n_nodes:3*n_nodes] = f[0:1]
-
-#         ic_A4 = torch.zeros((1, n_e*n_nodes)).to(device)
-#         ic_A4[:, 3*n_nodes:4*n_nodes] = f[0:1]
-
-#         ic_A = torch.vstack([ic_A1, ic_A2, ic_A3, ic_A4])
-#         ic_b = y_train_ic[i_b].reshape(-1, 1)
-
-#         initial_guess_value = torch.tensor(0)
-#         for i in range(6):
-#             # PDE (nonlinear)
-#             if i == 0:
-#                 theta = initial_guess_value
-#             else:
-#                 theta = f @ w_PI[2*n_nodes:3*n_nodes, :]
-
-#             pde_A1 = torch.zeros((n_s, n_e*n_nodes)).to(device)
-#             pde_A1[:, 0*n_nodes:1*n_nodes] = f_t
-#             pde_A1[:, 3*n_nodes:4*n_nodes] = -f * torch.cos(theta)
-
-#             pde_A2 = torch.zeros((n_s, n_e*n_nodes)).to(device)
-#             pde_A2[:, 1*n_nodes:2*n_nodes] = f_t
-#             pde_A2[:, 3*n_nodes:4*n_nodes] = -f * torch.sin(theta)
-
-#             pde_A3 = torch.zeros((n_s, n_e*n_nodes)).to(device)
-#             pde_A3[:, 2*n_nodes:3*n_nodes] = f_t
-#             pde_A3[:, 3*n_nodes:4*n_nodes] = -f / L * torch.tan(delta)
-
-#             pde_A4 = torch.zeros((n_s, n_e*n_nodes)).to(device)
-#             pde_A4[:, 3*n_nodes:4*n_nodes] = f_t
-
-#             pde_A = torch.vstack([pde_A1, pde_A2, pde_A3, pde_A4])
-
-#             pde_b = torch.zeros((pde_A.shape[0], 1)).to(device)
-#             pde_b[3*n_s:4*n_s, :] = a
-
-#             A = torch.vstack([ic_A, pde_A])
-#             b = torch.vstack([ic_b, pde_b])
-
-#             reg = 1e-6
-
-#             A = A.detach().cpu().numpy()
-#             b = b.detach().cpu().numpy()
-#             w_PI = np.linalg.inv(reg*np.eye(A.shape[1]) + (A.T @ A)) @ A.T @ b
-#             w_PI = torch.tensor(w_PI).float().to(device)
-            
-#         pred1 = f @ w_PI[0*n_nodes:1*n_nodes, :]
-#         pred2 = f @ w_PI[1*n_nodes:2*n_nodes, :]
-#         pred3 = f @ w_PI[2*n_nodes:3*n_nodes, :]
-#         pred4 = f @ w_PI[3*n_nodes:4*n_nodes, :]
-#         pred_all = torch.hstack([pred1, pred2, pred3, pred4])
-        
-#         # mse
-#         mse = torch.mean((label - pred_all) ** 2)
-#         mse_list.append(mse)
-#         mse_all = mse_all + mse
-    
-#     mse_all = mse_all / batch_size
-
-
-#     return mse_all, mse_list
+    mse_all = mse_all / batch_size
+    return mse_all, mse_list
 
 if __name__ == "__main__":
-
     gpu = 0
     loss_min, mse_min = PINN_PI(seed=0, gpu=0)
+    print(f"Test MSE: {loss_min.item()}, mse_list: {mse_min}")
