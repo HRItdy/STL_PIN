@@ -3,9 +3,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 from stl_rrt import BicycleRRT, BicycleState, BicycleControl, BicycleModel
-from PINN_PI import PINN_PI
+from PINN_PI import PINN_PI, generate_training_batch
 import torch.nn as nn
 from scipy.interpolate import interp1d
+import torch.backends.cudnn as cudnn
+import time
 
 # --------------------------------------------
 # RRT + STL + PINN-MPC integration pipeline
@@ -218,71 +220,60 @@ class ReferenceTrackingMPC:
         self.w_state = w_state
         self.w_ctrl = w_ctrl
         self.w_smooth = w_smooth
+        self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
     def _rollout(self, x0: np.ndarray, u_seq: np.ndarray):
         x_seq = []
-        x = torch.tensor(x0, dtype=torch.float32)
+        x = np.array(x0, dtype=np.float32)
         for i in range(self.H):
-            u = torch.tensor(u_seq[i], dtype=torch.float32, requires_grad=True)
-            
-            # Ensure the PINN can handle gradients properly
-            with torch.no_grad():
-                x = self.pinn.predict_next_state(x, u, self.dt, substeps=1)
-                x_seq.append(x)
-            # except RuntimeError as e:
-            #     if "grad" in str(e).lower():
-            #         # If gradient computation fails, use detached version and re-enable gradients
-            #         x_detached = x.detach().requires_grad_(True)
-            #         u_detached = u.detach().requires_grad_(True)
-            #         x = self.pinn.predict_next_state(x_detached, u_detached, self.dt, substeps=1)
-            #         x_seq.append(x)
-            #     else:
-            #         raise e
-        return torch.stack(x_seq, dim=0)  # (H, 4)
+            u = np.array(u_seq[i], dtype=np.float32)
+            batch_size = 1
+            T = 5.0
+            dt = 0.05
+            n_nodes_list = [256, 256, 4]
+            # Generate training batch as numpy arrays
+            x, y = generate_training_batch(x, u, batch_size, T, dt, False)
+            x_all, y_all = x.cpu().numpy(), y.cpu().numpy()
+            _ic = x_all[:, 0] == 0
+            x_ic = x_all[_ic]
+            y_ic = y_all[_ic]
+            pred = self.pinn.infer(x_all, y_all, x_ic, y_ic, n_nodes_list, self.device)
+            pred_np = np.array(pred).squeeze()
+            x = pred_np[0] if len(pred_np.shape) > 1 else pred_np
+            x_seq.append(x.copy())
+        return np.stack(x_seq)
 
     def _cost(self, u_flat: np.ndarray, x0: np.ndarray, ref_seq: np.ndarray):
-        u_seq = u_flat.reshape(self.H, 2)
-        
-        # Ensure gradients are enabled for optimization
-        with torch.enable_grad():
-            x_preds = self._rollout(x0, u_seq)  # (H, 4)
-            ref_t = torch.tensor(ref_seq[:, :4], dtype=torch.float32)
-            
-            # state tracking (x,y,theta,v)
-            state_err = x_preds - ref_t
-            J_state = torch.sum(state_err ** 2)
-            
-            # control effort and smoothness
-            u_t = torch.tensor(u_seq, dtype=torch.float32)
-            J_ctrl = torch.sum(u_t ** 2)
-            J_smooth = torch.sum((u_t[1:] - u_t[:-1]) ** 2) if self.H > 1 else torch.tensor(0.0)
-            
-            J = self.w_state * J_state + self.w_ctrl * J_ctrl + self.w_smooth * J_smooth
-        
-        return float(J.item())
+        u_seq = u_flat.reshape(self.H, 2).astype(np.float32)
+        x0_np = np.array(x0, dtype=np.float32)
+        ref_np = np.array(ref_seq[:, :4], dtype=np.float32)
+        x_preds = self._rollout(x0_np, u_seq)
+        state_err = x_preds - ref_np
+        J_state = np.sum(state_err ** 2)
+        J_ctrl = np.sum(u_seq ** 2)
+        if self.H > 1:
+            J_smooth = np.sum((u_seq[1:] - u_seq[:-1]) ** 2)
+        else:
+            J_smooth = 0.0
+        J = self.w_state * J_state + self.w_ctrl * J_ctrl + self.w_smooth * J_smooth
+        return float(J)
 
     def optimize(self, x0: np.ndarray, ref_seq: np.ndarray):
         u0 = np.zeros((self.H, 2), dtype=np.float64)
         bounds = list(self.u_bounds) * self.H
-        
-        # Wrap the cost function to handle potential gradient issues
-        def safe_cost(u_flat):
-            try:
-                return self._cost(u_flat, x0, ref_seq)
-            except RuntimeError as e:
-                if "grad" in str(e).lower():
-                    # If gradient computation fails, return a penalty cost
-                    print(f"Warning: Gradient computation failed, using fallback cost")
-                    return 1e6
-                else:
-                    raise e
-        
-        res = minimize(safe_cost, u0.flatten(), method='L-BFGS-B', bounds=bounds)
-        if not res.success:
-            # fallback: small acceleration towards heading, zero steer
-            print(f"Warning: Optimization failed, using fallback control")
-            return u0
-        return res.x.reshape(self.H, 2)
+        res = minimize(
+                self._cost, 
+                u0.flatten(), 
+                args=(x0, ref_seq),
+                method='SLSQP', 
+                bounds=bounds,
+                options={'maxiter': 10, 'disp': False}
+        )
+        if res.success:
+            return res.x.reshape(self.H, 2).astype(np.float32)
+        else:
+            print("MPC optimization failed, using zero controls.")
+            return np.zeros((self.H, 2), dtype=np.float32)
 
 # -------- Utilities to use an RRT trajectory as reference --------
 
@@ -342,58 +333,115 @@ def sample_reference_from_path(path: np.ndarray, start_idx: int, horizon: int, d
     
     return ref
 
+
 # --------- Closed-loop control using RRT reference + PINN-MPC ---------
 
-def rrt_pinn_mpc_control_loop(rrt_paths, trained_pinn_model, initial_state, steps=80, horizon=15, dt=0.1):
+def find_nearest_time_index(path: np.ndarray, current_time: float):
+    """Find the index in the path whose time stamp is closest to current_time."""
+    time_diffs = np.abs(path[:, 4] - current_time)
+    return int(np.argmin(time_diffs))
+
+def rrt_pinn_mpc_control_loop(rrt_paths, initial_state, steps=80, horizon=15, dt=0.1):
     """
     rrt_paths: list of numpy arrays, each of shape (N_i, 5) with columns [x,y,theta,v,t]
-    trained_pinn_model: the PINN instance previously trained
     initial_state: np.array(4,) = [x,y,theta,v]
     Returns history dict with states, controls, references.
     """
-    mpc = ReferenceTrackingMPC(trained_pinn_model, horizon=horizon, dt=dt)
+    
+    # Initialize the trained PINN
+    gpu = 0
+    seed = 0
+    # pred_all = PINN_PI(seed=0, gpu=0)
+    # print(f"Prediction shape: {np.array(pred_all).shape}")
+    
+    torch.cuda.set_device(gpu)
+    cudnn.benchmark = True
+    torch.manual_seed(seed)
+    cudnn.enabled = True
+    torch.cuda.manual_seed(seed)
 
-    x = np.array(initial_state, dtype=np.float32)
-    states = [x.copy()]
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    input_dim = 7
+    n_nodes_first_layer = 512
+    n_nodes_list = [256, 256, 4]
+    i_ac_list = [9, 9]
+
+    DNN = PINN_PI(seed=0, gpu=0)
+        
+    mpc = ReferenceTrackingMPC(pinn_stepper=DNN, horizon=horizon, dt=dt)
+
+    x = torch.tensor(initial_state, dtype=torch.float32, device=device)
+    states = [x.clone()]
     controls = []
     refs_logged = []
 
-    # choose the best path for the changed initial state
-    best_path = find_best_rrt_path(rrt_paths, x[:2])
+    best_path = find_best_rrt_path(rrt_paths, x[:2].cpu().numpy())
     if best_path is None:
         raise ValueError("No RRT paths provided.")
-    best_path = np.asarray(best_path, dtype=np.float32)
+    best_path = torch.tensor(best_path, dtype=torch.float32, device=device)
+
+    mpc_times = []
+    deviations = []
+
+    # Start at the first time stamp
+    current_time = best_path[0, 4].item()
 
     for k in range(steps):
-        # find nearest point along the chosen path to current position
-        idx = nearest_index_on_path(best_path, x[:2])
-        
-        # get reference window for the MPC horizon (improved for interpolated paths)
-        ref_window = sample_reference_from_path(best_path, idx, horizon, dt)  # (H, 5)
-        refs_logged.append(ref_window)
+        print(f"Step {k+1}/{steps}, current state: {x.cpu().numpy()}")
 
-        # optimize control sequence to track ref
-        u_seq = mpc.optimize(x, ref_window)
+        # Find the reference index by time, not by spatial proximity
+        idx = find_nearest_time_index(best_path.cpu().numpy(), current_time)
+
+        # Sample reference window starting from idx
+        ref_window = sample_reference_from_path(best_path.cpu().numpy(), idx, horizon, dt)
+        ref_window = torch.tensor(ref_window, dtype=torch.float32, device=device)
+        refs_logged.append(ref_window.clone())
+
+        # Time the MPC optimization
+        t_mpc_start = time.time()
+        u_seq = mpc.optimize(x.cpu().numpy(), ref_window.cpu().numpy())
+        t_mpc_end = time.time()
+        mpc_times.append(t_mpc_end - t_mpc_start)
+
         u0 = u_seq[0]
-        controls.append(u0.copy())
+        controls.append(torch.tensor(u0, dtype=torch.float32, device=device))
 
-        # propagate the system using the PINN model's predict_next_state
-        x_next = trained_pinn_model.predict_next_state(torch.tensor(x, dtype=torch.float32),
-                                                      torch.tensor(u0, dtype=torch.float32), dt).detach().cpu().numpy()
-        x = x_next
-        states.append(x.copy())
+        # Forward simulation
+        batch_size = 1
+        T = 5.0
+        dt_sim = dt
+        x, y = generate_training_batch(x, u0, batch_size, T, dt_sim, False)
+        x_all, y_all = x.to(device), y.to(device)
+        _ic = x_all[:, 0] == 0
+        x_ic = x_all[_ic]
+        y_ic = y_all[_ic]
+        pred = DNN.infer(x_all, y_all, x_ic, y_ic, [256, 256, 4], device)
+        pred_tensor = torch.tensor(pred, dtype=torch.float32, device=device).squeeze()
+        x = pred_tensor[0]
+        states.append(x.clone())
 
-        # (optional) break if near the end of path
+        # Advance the time by dt for next step
+        current_time += dt
+
+        # Calculate deviation from reference path at current step
+        ref_xy = best_path[idx, :2].cpu().numpy()
+        x_xy = x[:2].cpu().numpy()
+        deviation = np.linalg.norm(x_xy - ref_xy)
+        deviations.append(deviation)
+
         if idx >= len(best_path) - 2:
             break
 
     return {
-        "states": np.array(states),
-        "controls": np.array(controls),
-        "references": np.array(refs_logged, dtype=object)
+        "states": torch.stack(states).cpu().numpy(),
+        "controls": torch.stack(controls).cpu().numpy(),
+        "references": [r.cpu().numpy() for r in refs_logged],
+        "mpc_times": np.array(mpc_times),
+        "deviations": np.array(deviations)
     }
     
-def test_pinn_accuracy(pinn_model, x0, u, dt=0.1, steps=20, device='cpu'):
+# def test_pinn_accuracy(pinn_model, x0, u, dt=0.1, steps=20, device='cpu'):
     """
     Compare PINN_PI predictions to ground truth (RK4 bicycle model) for a constant control input.
     Prints and returns the MSE loss over the trajectory.
@@ -402,6 +450,14 @@ def test_pinn_accuracy(pinn_model, x0, u, dt=0.1, steps=20, device='cpu'):
     from PINN_PI import rk4_step
 
     # Prepare initial state and control
+    batch_size = 1
+    T = 5.0
+    dt = 0.05
+    x_train, y_train = generate_training_batch(batch_size, T, dt)
+    x_train_all, y_train_all = x_train.detach().cpu().numpy(), y_train.detach().cpu().numpy()
+    _ic = x_train_all[:, 0] == 0
+    x_train_ic = x_train_all[_ic]
+    y_train_ic = y_train_all[_ic]
     x_true = torch.tensor(x0, dtype=torch.float32, device=device)
     x_pinn = torch.tensor(x0, dtype=torch.float32, device=device)
     u_tensor = torch.tensor(u, dtype=torch.float32, device=device)
@@ -440,102 +496,109 @@ def test_pinn_accuracy(pinn_model, x0, u, dt=0.1, steps=20, device='cpu'):
 
 if __name__ == "__main__":
     # Test PINN accuracy
-    checkpoint_path= 'trained_model.pt'
-    pinn_model = PINN_PI(checkpoint_path=checkpoint_path)
-    x0 = [0.0, 0.0, 0.0, 1.0]  # initial state: [x, y, theta, v]
-    u = [1.0, 0.1]             # constant control: [a, delta]
-    test_pinn_accuracy(pinn_model, x0, u, dt=0.05, steps=20)
-    print("PINN accuracy test completed.")
-    # # 1. Generate and interpolate STL-compliant RRT path
-    # print("Generating and interpolating STL-compliant RRT path...")
-    # sparse_path, dense_path = generate_interpolated_rrt_path(target_dt=0.1, smooth_velocity=True)
-    # print(f"Dense path shape: {dense_path.shape}")
+    # checkpoint_path= 'trained_model.pt'
+    # pinn_model = PINN_PI(checkpoint_path=checkpoint_path)
+    # x0 = [0.0, 0.0, 0.0, 1.0]  # initial state: [x, y, theta, v]
+    # u = [1.0, 0.1]             # constant control: [a, delta]
+    # test_pinn_accuracy(pinn_model, x0, u, dt=0.05, steps=20)
+    # print("PINN accuracy test completed.")
+    # 1. Generate and interpolate STL-compliant RRT path
+    print("Generating and interpolating STL-compliant RRT path...")
+    sparse_path, dense_path = generate_interpolated_rrt_path(target_dt=0.1, smooth_velocity=True)
+    print(f"Dense path shape: {dense_path.shape}")
 
-    # # 2. Load trained PINN model using PINN_PI from PINN_PI.py
-    # print("Loading trained PINN model...")
-    # checkpoint_path = 'trained_model.pt'
-    # try:
-    #     pinn_model = PINN_PI(checkpoint_path=checkpoint_path)
-    #     print("Loaded trained PINN model from", checkpoint_path)
-    # except Exception as e:
-    #     print("Warning: Could not load trained_model.pt, using untrained PINN. Error:", e)
-    #     pinn_model = PINN_PI()
+    # 2. Run closed-loop control using interpolated RRT reference and PINN-MPC
+    print("Running closed-loop control with interpolated RRT reference and PINN-MPC...")
+    initial_state = dense_path[0, :4]  # [x, y, theta, v]
+    rrt_paths = [dense_path]  # Use interpolated path
+    out = rrt_pinn_mpc_control_loop(
+        rrt_paths=rrt_paths,
+        initial_state=initial_state,
+        steps=20,
+        horizon=1,
+        dt=0.05
+    )
 
-    # # 3. Run closed-loop control using interpolated RRT reference and PINN-MPC
-    # print("Running closed-loop control with interpolated RRT reference and PINN-MPC...")
-    # initial_state = dense_path[0, :4]  # [x, y, theta, v]
-    # rrt_paths = [dense_path]  # Use interpolated path
-    # out = rrt_pinn_mpc_control_loop(
-    #     rrt_paths=rrt_paths,
-    #     trained_pinn_model=pinn_model,
-    #     initial_state=initial_state,
-    #     steps=20,
-    #     horizon=5,
-    #     dt=0.1
-    # )
-
-    # # 4. Plot results comparing sparse vs dense paths
-    # print("Plotting results...")
-    # states = out['states']
+    # 4. Plot results comparing sparse vs dense paths
+    print("Plotting results...")
+    states = out['states']
     
-    # plt.figure(figsize=(15, 10))
+    plt.figure(figsize=(15, 10))
     
-    # # Plot 1: Trajectory comparison
-    # plt.subplot(2, 2, 1)
-    # plt.plot(sparse_path[:, 0], sparse_path[:, 1], 'b--', linewidth=2, label='Original Sparse RRT Path')
-    # plt.plot(dense_path[:, 0], dense_path[:, 1], 'g:', linewidth=1.5, label='Interpolated Dense Path')
-    # plt.plot(states[:, 0], states[:, 1], 'r-', linewidth=2, label='Closed-loop Trajectory')
-    # plt.scatter(sparse_path[0, 0], sparse_path[0, 1], c='g', marker='o', s=100, label='Start')
-    # plt.scatter(sparse_path[-1, 0], sparse_path[-1, 1], c='k', marker='*', s=200, label='Goal')
-    # plt.xlabel('X [m]')
-    # plt.ylabel('Y [m]')
-    # plt.title('Trajectory Comparison')
-    # plt.legend()
-    # plt.grid(True, alpha=0.3)
-    # plt.axis('equal')
+    # Plot 1: Trajectory comparison
+    plt.subplot(2, 2, 1)
+    plt.plot(sparse_path[:, 0], sparse_path[:, 1], 'b--', linewidth=2, label='Original Sparse RRT Path')
+    plt.plot(dense_path[:, 0], dense_path[:, 1], 'g:', linewidth=1.5, label='Interpolated Dense Path')
+    plt.plot(states[:, 0], states[:, 1], 'r-', linewidth=2, label='Closed-loop Trajectory')
+    plt.scatter(sparse_path[0, 0], sparse_path[0, 1], c='g', marker='o', s=100, label='Start')
+    plt.scatter(sparse_path[-1, 0], sparse_path[-1, 1], c='k', marker='*', s=200, label='Goal')
+    plt.xlabel('X [m]')
+    plt.ylabel('Y [m]')
+    plt.title('Trajectory Comparison')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.axis('equal')
     
-    # # Plot 2: Velocity profiles
-    # plt.subplot(2, 2, 2)
-    # plt.plot(sparse_path[:, 4], sparse_path[:, 3], 'b--o', label='Sparse RRT Velocity')
-    # plt.plot(dense_path[:, 4], dense_path[:, 3], 'g:', label='Interpolated Velocity')
-    # plt.plot(np.arange(len(states)) * 0.1, states[:, 3], 'r-', label='Actual Velocity')
-    # plt.xlabel('Time [s]')
-    # plt.ylabel('Velocity [m/s]')
-    # plt.title('Velocity Profile Comparison')
-    # plt.legend()
-    # plt.grid(True, alpha=0.3)
+    # Plot 2: Velocity profiles
+    plt.subplot(2, 2, 2)
+    plt.plot(sparse_path[:, 4], sparse_path[:, 3], 'b--o', label='Sparse RRT Velocity')
+    plt.plot(dense_path[:, 4], dense_path[:, 3], 'g:', label='Interpolated Velocity')
+    plt.plot(np.arange(len(states)) * 0.1, states[:, 3], 'r-', label='Actual Velocity')
+    plt.xlabel('Time [s]')
+    plt.ylabel('Velocity [m/s]')
+    plt.title('Velocity Profile Comparison')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
     
-    # # Plot 3: Path density comparison
-    # plt.subplot(2, 2, 3)
-    # sparse_distances = np.diff(sparse_path[:, :2], axis=0)
-    # sparse_step_sizes = np.linalg.norm(sparse_distances, axis=1)
-    # dense_distances = np.diff(dense_path[:, :2], axis=0)
-    # dense_step_sizes = np.linalg.norm(dense_distances, axis=1)
+    # Plot 3: Path density comparison
+    plt.subplot(2, 2, 3)
+    sparse_distances = np.diff(sparse_path[:, :2], axis=0)
+    sparse_step_sizes = np.linalg.norm(sparse_distances, axis=1)
+    dense_distances = np.diff(dense_path[:, :2], axis=0)
+    dense_step_sizes = np.linalg.norm(dense_distances, axis=1)
     
-    # plt.hist(sparse_step_sizes, bins=20, alpha=0.7, label=f'Sparse (avg: {np.mean(sparse_step_sizes):.3f}m)', color='blue')
-    # plt.hist(dense_step_sizes, bins=20, alpha=0.7, label=f'Dense (avg: {np.mean(dense_step_sizes):.3f}m)', color='green')
-    # plt.xlabel('Step Size [m]')
-    # plt.ylabel('Frequency')
-    # plt.title('Path Step Size Distribution')
-    # plt.legend()
-    # plt.grid(True, alpha=0.3)
+    plt.hist(sparse_step_sizes, bins=20, alpha=0.7, label=f'Sparse (avg: {np.mean(sparse_step_sizes):.3f}m)', color='blue')
+    plt.hist(dense_step_sizes, bins=20, alpha=0.7, label=f'Dense (avg: {np.mean(dense_step_sizes):.3f}m)', color='green')
+    plt.xlabel('Step Size [m]')
+    plt.ylabel('Frequency')
+    plt.title('Path Step Size Distribution')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
     
-    # # Plot 4: Control inputs
-    # plt.subplot(2, 2, 4)
-    # controls = out['controls']
-    # time_controls = np.arange(len(controls)) * 0.1
-    # plt.plot(time_controls, controls[:, 0], 'r-', label='Acceleration')
-    # plt.plot(time_controls, controls[:, 1], 'b-', label='Steering')
-    # plt.xlabel('Time [s]')
-    # plt.ylabel('Control Input')
-    # plt.title('Control Inputs')
-    # plt.legend()
-    # plt.grid(True, alpha=0.3)
+    # Plot 4: Control inputs
+    plt.subplot(2, 2, 4)
+    controls = out['controls']
+    time_controls = np.arange(len(controls)) * 0.1
+    plt.plot(time_controls, controls[:, 0], 'r-', label='Acceleration')
+    plt.plot(time_controls, controls[:, 1], 'b-', label='Steering')
+    plt.xlabel('Time [s]')
+    plt.ylabel('Control Input')
+    plt.title('Control Inputs')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
     
-    # plt.tight_layout()
-    # plt.show()
+    plt.tight_layout()
+    plt.show()
     
-    # print(f"Control loop completed successfully!")
-    # print(f"Original sparse path: {len(sparse_path)} waypoints")
-    # print(f"Interpolated dense path: {len(dense_path)} waypoints")
-    # print(f"Final position error: {np.linalg.norm(states[-1][:2] - dense_path[-1][:2]):.3f} m")
+    # 5. Plot actual closed-loop trajectory in a separate figure
+    plt.figure(figsize=(8, 6))
+    plt.plot(states[:, 0], states[:, 1], 'r-', linewidth=2, label='Closed-loop Trajectory')
+    plt.scatter(states[0, 0], states[0, 1], c='g', marker='o', s=100, label='Start')
+    plt.scatter(states[-1, 0], states[-1, 1], c='k', marker='*', s=200, label='End')
+    plt.xlabel('X [m]')
+    plt.ylabel('Y [m]')
+    plt.title('Actual Closed-loop Trajectory')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.axis('equal')
+    plt.show()
+    
+    mpc_times = out['mpc_times']
+    deviations = out['deviations']
+    print(f"Control loop completed successfully!")
+    print(f"Original sparse path: {len(sparse_path)} waypoints")
+    print(f"Interpolated dense path: {len(dense_path)} waypoints")
+    print(f"Final position error: {np.linalg.norm(states[-1][:2] - dense_path[-1][:2]):.3f} m")
+    print(f"Average MPC optimization time per step: {np.mean(mpc_times):.4f} seconds")
+    print(f"Max deviation from reference path: {np.max(deviations):.4f} m")
+    print(f"Mean deviation from reference path: {np.mean(deviations):.4f} m")
